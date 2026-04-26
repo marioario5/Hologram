@@ -1,0 +1,29 @@
+# --- Secrets ---
+.env
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+env/
+.env/
+
+# --- C/C++ Build Artifacts ---
+*.o
+*.a
+*.so
+*.dylib
+*.out
+
+# --- Shell Scripts ---
+*.tmp
+*~
+
+# --- OS & Editor junk ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
