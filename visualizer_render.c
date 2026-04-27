@@ -103,6 +103,10 @@ static uint32_t buf0[DISPLAY_H * DISPLAY_W];
 static uint32_t buf1[DISPLAY_H * DISPLAY_W];
 static uint32_t *back_buf  = buf0;
 static uint32_t *front_buf = buf1;
+static uint8_t  stable_album[MAX_ALBUM_SIZE * MAX_ALBUM_SIZE * 3];
+static int      stable_album_ready = 0;
+static uint32_t stable_album_seq   = 0xFFFFFFFF;
+static int      stable_album_size  = 0;
 
 /* Framebuffer */
 static int      fb_fd = -1;
@@ -110,7 +114,7 @@ static uint32_t *fb   = NULL;
 static struct fb_var_screeninfo vinfo;
 
 /* Shared memory */
-static uint8_t *shm = NULL;
+static volatile uint8_t *shm = NULL;
 
 /* Current render parameters (copied from SHM once per frame) */
 typedef struct {
@@ -128,15 +132,17 @@ typedef struct {
     int      album_ready;
 } RenderParams;
 
-static RenderParams params;
+/* ── Two param structs, main thread writes the inactive one ── */
+static RenderParams params_buf[2];
+static int          params_idx = 0;   /* render threads always read this index */
 
 /* Thread sync */
 typedef struct {
-    int          thread_id;
-    int          start_row;
-    int          end_row;
-    RenderParams *p;
-    uint32_t     *buf;
+    int       thread_id;
+    int       start_row;
+    int       end_row;
+    int       p_idx;      /* which params_buf slot to read — replaces *p */
+    uint32_t *buf;
 } ThreadArgs;
 
 static pthread_t         threads[NUM_THREADS];
@@ -282,7 +288,11 @@ static void render_plasma_chunk(const RenderParams *p, uint32_t *buf,
                 ci = ci < NUM_COLORS - 1 ? ci : NUM_COLORS - 2;
                 float blend = (scaled - cum[ci]) / (cum[ci+1] - cum[ci] + 1e-6f);
                 blend = blend < 0 ? 0 : (blend > 1 ? 1 : blend);
-                row[x + k] = palette_lerp(p, ci, ci + 1, blend);
+                float inv_b = 1.0f - blend;
+                uint8_t r = (uint8_t)(p->palette[ci][0] * inv_b + p->palette[ci+1][0] * blend);
+                uint8_t g = (uint8_t)(p->palette[ci][1] * inv_b + p->palette[ci+1][1] * blend);
+                uint8_t b_ch = (uint8_t)(p->palette[ci][2] * inv_b + p->palette[ci+1][2] * blend);
+                row[x + k] = (0xFF << 24) | (r << 16) | (g << 8) | b_ch;
             }
         }
 #endif
@@ -304,7 +314,11 @@ static void render_plasma_chunk(const RenderParams *p, uint32_t *buf,
             ci = ci < NUM_COLORS - 1 ? ci : NUM_COLORS - 2;
             float blend = (scaled - cum[ci]) / (cum[ci+1] - cum[ci] + 1e-6f);
             blend = blend < 0 ? 0 : (blend > 1 ? 1 : blend);
-            row[x] = palette_lerp(p, ci, ci + 1, blend);
+            float inv_b = 1.0f - blend;
+            uint8_t r = (uint8_t)(p->palette[ci][0] * inv_b + p->palette[ci+1][0] * blend);
+            uint8_t g = (uint8_t)(p->palette[ci][1] * inv_b + p->palette[ci+1][1] * blend);
+            uint8_t b_ch = (uint8_t)(p->palette[ci][2] * inv_b + p->palette[ci+1][2] * blend);
+            row[x] = (0xFF << 24) | (r << 16) | (g << 8) | b_ch;
         }
     }
 }
@@ -377,11 +391,9 @@ static void render_stalagmites_chunk(const RenderParams *p, uint32_t *buf,
 static void overlay_album_art(const RenderParams *p, uint32_t *buf) {
     if (!p->album_ready) return;
     int sz  = (int)p->album_size;
+    if (sz < 10 || sz > MAX_ALBUM_SIZE) return;
     int x0  = (DISPLAY_W - sz) / 2;
     int y0  = (DISPLAY_H - sz) / 2;
-    int r2  = (sz / 2) * (sz / 2);
-    int cx2 = sz / 2;
-    int cy2 = sz / 2;
 
     for (int ay = 0; ay < sz; ay++) {
         int gy = y0 + ay;
@@ -389,16 +401,11 @@ static void overlay_album_art(const RenderParams *p, uint32_t *buf) {
         for (int ax = 0; ax < sz; ax++) {
             int gx = x0 + ax;
             if (gx < 0 || gx >= DISPLAY_W) continue;
-
-            int dx = ax - cx2;
-            int dy = ay - cy2;
-            if (dx*dx + dy*dy > r2) continue;
-
-            int     src = (ay * sz + ax) * 3;
-            uint8_t r   = p->album_data[src];
-            uint8_t g   = p->album_data[src+1];
-            uint8_t b   = p->album_data[src+2];
-            buf[gy * DISPLAY_W + gx] = rgb_to_argb8888(r, g, b);
+            int src = (ay * sz + ax) * 3;
+            buf[gy * DISPLAY_W + gx] = rgb_to_argb8888(
+                p->album_data[src],
+                p->album_data[src+1],
+                p->album_data[src+2]);
         }
     }
 }
@@ -407,7 +414,7 @@ static void overlay_album_art(const RenderParams *p, uint32_t *buf) {
    Frequency bars overlay
    ════════════════════════════════════════════════════════════════════════════ */
 
-static void draw_freq_bars(const RenderParams *p, uint32_t *buf) {
+static void draw_freq_bars_range(const RenderParams *p, uint32_t *buf, int bar_start, int bar_end) {
     int   center_y     = (int)(DISPLAY_H * 0.82f);
     int   max_half_h   = (int)(DISPLAY_H * 0.08f);
     float total_w      = DISPLAY_W * 0.80f;
@@ -416,7 +423,7 @@ static void draw_freq_bars(const RenderParams *p, uint32_t *buf) {
     int   actual_bar_w = bar_w - gap > 2 ? bar_w - gap : 2;
     int   start_x      = (int)((DISPLAY_W - total_w) / 2);
 
-    for (int i = 0; i < NUM_BANDS; i++) {
+    for (int i = bar_start; i < bar_end; i++) {
         int half = (int)(p->bands[i] / 255.0f * max_half_h);
         if (half < 2) half = 2;
 
@@ -437,6 +444,10 @@ static void draw_freq_bars(const RenderParams *p, uint32_t *buf) {
     }
 }
 
+static void draw_freq_bars(const RenderParams *p, uint32_t *buf) {
+    draw_freq_bars_range(p, buf, 0, NUM_BANDS);
+}
+
 /* ════════════════════════════════════════════════════════════════════════════
    Thread worker
    ════════════════════════════════════════════════════════════════════════════ */
@@ -445,20 +456,27 @@ static void *render_thread(void *arg) {
     ThreadArgs *ta = (ThreadArgs *)arg;
 
     while (1) {
-        pthread_barrier_wait(&frame_barrier);
+        pthread_barrier_wait(&frame_barrier);   /* start — params_idx already updated */
 
-        if (ta->p->mode == 0)
-            render_plasma_chunk(ta->p, ta->buf, ta->start_row, ta->end_row);
+        const RenderParams *p = &params_buf[ta->p_idx];   /* read stable copy */
+
+        if (p->mode == 0)
+            render_plasma_chunk(p, ta->buf, ta->start_row, ta->end_row);
         else
-            render_stalagmites_chunk(ta->p, ta->buf, ta->start_row, ta->end_row);
+            render_stalagmites_chunk(p, ta->buf, ta->start_row, ta->end_row);
 
         pthread_barrier_wait(&frame_barrier);
 
-        if (ta->thread_id == 0) {
-            if (ta->p->show_bands)
-                draw_freq_bars(ta->p, ta->buf);
-            if (ta->p->show_album)
-                overlay_album_art(ta->p, ta->buf);
+        /* Parallelize overlay work across threads */
+        if (p->show_bands) {
+            int bands_per_thread = (NUM_BANDS + NUM_THREADS - 1) / NUM_THREADS;
+            int bar_start = ta->thread_id * bands_per_thread;
+            int bar_end = (ta->thread_id + 1) * bands_per_thread;
+            if (bar_end > NUM_BANDS) bar_end = NUM_BANDS;
+            draw_freq_bars_range(p, ta->buf, bar_start, bar_end);
+        }
+        if (p->show_album && ta->thread_id == 0) {
+            overlay_album_art(p, ta->buf);
         }
 
         pthread_barrier_wait(&frame_barrier);
@@ -471,44 +489,69 @@ static void *render_thread(void *arg) {
    ════════════════════════════════════════════════════════════════════════════ */
 
 static int read_shm(RenderParams *p) {
-    uint32_t magic = *(uint32_t *)(shm + OFF_MAGIC);
+    uint32_t magic = *(volatile uint32_t *)(shm + OFF_MAGIC);
     if (magic != MAGIC_VAL) return 0;
 
-    memcpy(p->bands, shm + OFF_BANDS, NUM_BANDS * sizeof(float));
+    /* Batch read parameters into temp buffer for atomicity */
+    uint8_t temp[256];
+    memcpy(temp, (const void*)(shm + OFF_BANDS), 180);
+    
+    memcpy(p->bands, temp, NUM_BANDS * sizeof(float));
 
     for (int i = 0; i < NUM_COLORS; i++) {
-        int base = OFF_PALETTE + i * 3;
-        p->palette[i][0] = shm[base];
-        p->palette[i][1] = shm[base+1];
-        p->palette[i][2] = shm[base+2];
+        int base = OFF_PALETTE + i * 3 - OFF_BANDS;
+        p->palette[i][0] = temp[base];
+        p->palette[i][1] = temp[base+1];
+        p->palette[i][2] = temp[base+2];
     }
 
-    float *abcd = (float *)(shm + OFF_PLASMA_ABCD);
+    float *abcd = (float *)(temp + OFF_PLASMA_ABCD - OFF_BANDS);
     p->a = abcd[0]; p->b = abcd[1]; p->c = abcd[2]; p->d = abcd[3];
-    float *cxcy = (float *)(shm + OFF_PLASMA_CXCY);
+    float *cxcy = (float *)(temp + OFF_PLASMA_CXCY - OFF_BANDS);
     p->cx = cxcy[0]; p->cy = cxcy[1];
 
-    memcpy(p->stala_colors, shm + OFF_STALA_COLORS, 7 * sizeof(float));
+    memcpy(p->stala_colors, temp + OFF_STALA_COLORS - OFF_BANDS, 7 * sizeof(float));
 
-    p->mode       = *(uint32_t *)(shm + OFF_MODE);
-    p->show_album = *(uint32_t *)(shm + OFF_SHOW_ALBUM);
-    p->show_bands = *(uint32_t *)(shm + OFF_SHOW_BANDS);
-    p->album_size = *(uint32_t *)(shm + OFF_ALBUM_SIZE);
-    p->bpm        = *(uint32_t *)(shm + OFF_BPM);
+    p->mode       = *(volatile uint32_t *)(shm + OFF_MODE);
+    p->show_album = *(volatile uint32_t *)(shm + OFF_SHOW_ALBUM);
+    p->show_bands = *(volatile uint32_t *)(shm + OFF_SHOW_BANDS);
+    p->album_size = *(volatile uint32_t *)(shm + OFF_ALBUM_SIZE);
+    p->bpm        = *(volatile uint32_t *)(shm + OFF_BPM);
 
-    p->album_ready = (*(uint32_t *)(shm + OFF_ALBUM_READY)) ? 1 : 0;
-    if (p->album_ready) {
-        int sz = (int)p->album_size;
-        if (sz < 10 || sz > MAX_ALBUM_SIZE) {
-            p->album_ready = 0;
-        } else {
-            memcpy(p->album_data, shm + OFF_ALBUM_DATA, sz * sz * 3);
-            if (!(*(uint32_t *)(shm + OFF_ALBUM_READY)))
-                p->album_ready = 0;
+    /* Cache album_ready to reduce volatile reads */
+    p->album_ready = stable_album_ready;
+    if (stable_album_ready && stable_album_size > 0) {
+        p->album_size = stable_album_size;
+        memcpy(p->album_data, stable_album, stable_album_size * stable_album_size * 3);
     }
-}  
 
     return 1;
+}
+
+static void try_update_album(void) {
+    if (!*(uint32_t *)(shm + OFF_ALBUM_READY)) {
+        stable_album_ready = 0;
+        return;
+    }
+    uint32_t seq = *(uint32_t *)(shm + OFF_SEQ);
+    if (seq == stable_album_seq) return;
+
+    int sz = (int)(*(uint32_t *)(shm + OFF_ALBUM_SIZE));
+    if (sz < 10 || sz > MAX_ALBUM_SIZE) {
+        return;
+    }
+
+    uint32_t before = *(uint32_t *)(shm + OFF_ALBUM_READY);
+    memcpy(stable_album, (const void*)(shm + OFF_ALBUM_DATA), sz * sz * 3);
+    uint32_t after  = *(uint32_t *)(shm + OFF_ALBUM_READY);
+
+    if (before && after) {
+        stable_album_ready = 1;
+        stable_album_seq   = seq;
+        stable_album_size  = sz;
+    } else {
+        return;
+    }
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -538,6 +581,8 @@ static int open_framebuffer(void) {
                           PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
     if (fb == MAP_FAILED) { perror("mmap fb"); return 0; }
 
+    memset(fb, 0, SCREEN_W * SCREEN_H * 2 * BYTES_PP);
+
     printf("Framebuffer: %dx%d @ %dbpp\n",
            vinfo.xres, vinfo.yres, vinfo.bits_per_pixel);
     return 1;
@@ -545,9 +590,16 @@ static int open_framebuffer(void) {
 
 static void flip_buffer(uint32_t *rendered_buf) {
     for (int y = 0; y < DISPLAY_H; y++) {
-        memcpy(fb + y * SCREEN_W,
-               rendered_buf + y * DISPLAY_W,
-               DISPLAY_W * BYTES_PP);
+        uint32_t *fb_row = fb + y * SCREEN_W;
+        memcpy(fb_row, rendered_buf + y * DISPLAY_W, DISPLAY_W * BYTES_PP);
+        
+        /* Zero right padding in 64-bit chunks (2 pixels at a time) */
+        uint64_t *fb_tail = (uint64_t *)(fb_row + DISPLAY_W);
+        int pad_pixels = SCREEN_W - DISPLAY_W;
+        for (int i = 0; i < pad_pixels / 2; i++)
+            fb_tail[i] = 0ULL;
+        if (pad_pixels & 1)
+            fb_row[SCREEN_W - 1] = 0;
     }
 }
 /* ════════════════════════════════════════════════════════════════════════════
@@ -593,15 +645,18 @@ int main(void) {
 
     pthread_barrier_init(&frame_barrier, NULL, NUM_THREADS + 1);
 
-    read_shm(&params);
-    params.t = 0.0f;
+    /* ── one-time startup init ── */
+    read_shm(&params_buf[0]);
+    params_buf[0].t = 0.0f;
+    params_buf[1]   = params_buf[0];
+    params_idx      = 0;
 
     for (int i = 0; i < NUM_THREADS; i++) {
         thread_args[i].thread_id = i;
         thread_args[i].start_row = i * ROWS_PER_THREAD;
         thread_args[i].end_row   = (i == NUM_THREADS-1) ? DISPLAY_H
                                                          : (i+1) * ROWS_PER_THREAD;
-        thread_args[i].p         = &params;
+        thread_args[i].p_idx     = params_idx;
         thread_args[i].buf       = back_buf;
         pthread_create(&threads[i], NULL, render_thread, &thread_args[i]);
         printf("Thread %d: rows %d-%d\n",
@@ -612,34 +667,42 @@ int main(void) {
     const long target_ns = 1000000000L / 30;
 
     while (1) {
-        clock_gettime(CLOCK_MONOTONIC, &frame_start);
+    clock_gettime(CLOCK_MONOTONIC, &frame_start);
 
-        read_shm(&params);
+    int write_idx = params_idx ^ 1;
 
-        for (int i = 0; i < NUM_THREADS; i++)
-            thread_args[i].buf = back_buf;
+    /* safe window — all threads blocked at barrier 1 waiting for us */
+    try_update_album();
+    read_shm(&params_buf[write_idx]);
+    params_buf[write_idx].t = params_buf[params_idx].t;
 
-        pthread_barrier_wait(&frame_barrier);   /* start render */
-        pthread_barrier_wait(&frame_barrier);   /* chunks done  */
-        pthread_barrier_wait(&frame_barrier);   /* overlays done */
+    params_idx = write_idx;
+    for (int i = 0; i < NUM_THREADS; i++) {
+        thread_args[i].p_idx = params_idx;
+        thread_args[i].buf   = back_buf;
+    }
 
-        flip_buffer(back_buf);
+    pthread_barrier_wait(&frame_barrier);   /* start render */
+    pthread_barrier_wait(&frame_barrier);   /* chunks done  */
+    pthread_barrier_wait(&frame_barrier);   /* overlays done */
 
-        uint32_t *tmp = back_buf;
-        back_buf  = front_buf;
-        front_buf = tmp;
+    flip_buffer(back_buf);
 
-        float bpm_factor = params.bpm / 120.0f;
-        params.t += bpm_factor * 0.07f;
+    uint32_t *tmp = back_buf;
+    back_buf  = front_buf;
+    front_buf = tmp;
 
-        clock_gettime(CLOCK_MONOTONIC, &frame_end);
-        long elapsed_ns = (frame_end.tv_sec  - frame_start.tv_sec)  * 1000000000L
-                        + (frame_end.tv_nsec - frame_start.tv_nsec);
-        long sleep_ns = target_ns - elapsed_ns;
-        if (sleep_ns > 0) {
-            struct timespec ts = { 0, sleep_ns };
-            nanosleep(&ts, NULL);
-        }
+    float bpm_factor = params_buf[params_idx].bpm / 120.0f;
+    params_buf[params_idx].t += bpm_factor * 0.07f;
+
+    clock_gettime(CLOCK_MONOTONIC, &frame_end);
+    long elapsed_ns = (frame_end.tv_sec  - frame_start.tv_sec)  * 1000000000L
+                    + (frame_end.tv_nsec - frame_start.tv_nsec);
+    long sleep_ns = target_ns - elapsed_ns;
+    if (sleep_ns > 0) {
+        struct timespec ts = { 0, sleep_ns };
+        clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
+    }
     }
 
     return 0;

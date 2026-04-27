@@ -767,9 +767,12 @@ def stalagmite_thread():
 # SHM WRITER — picks the correct state based on active mode, never mixes them
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-_last_art_id = None
+_last_art_id     = None
+_album_write_seq = 0
+
 def _write_shm():
-    global _last_art_id
+    global _last_art_id, _album_write_seq   # both need global
+
     with active_mode_lock:
         mode = active_mode
 
@@ -782,8 +785,6 @@ def _write_shm():
 
     with ui_state_lock:
         ui = dict(ui_state)
-        ui['seq'] = (ui['seq'] + 1) & 0xFFFFFFFF
-        ui_state['seq'] = ui['seq']
 
     shm_f32s(OFF_BANDS, [float(b) for b in ui['bands']])
     for i, c in enumerate(ds['palette']):
@@ -800,19 +801,26 @@ def _write_shm():
     if ds['album_art_bytes']:
         current_id = ds.get('last_track_id')
         if current_id != _last_art_id:
-            shm_u32(OFF_ALBUM_READY, 0)
+            # do ALL slow work before touching SHM flags
             ds['album_art_bytes'].seek(0)
             sz = ui['album_size']
             img = (Image.open(ds['album_art_bytes'])
                    .convert('RGB')
                    .resize((sz, sz), Image.LANCZOS))
-            shm[OFF_ALBUM_DATA : OFF_ALBUM_DATA + sz * sz * 3] = img.tobytes()
-            _last_art_id = current_id
+            pixel_bytes = img.tobytes()
+
+            _album_write_seq = (_album_write_seq + 1) & 0xFFFFFFFF
+            shm_u32(OFF_ALBUM_READY, 0)
+            shm_u32(OFF_ALBUM_SIZE, sz)
+            shm[OFF_ALBUM_DATA : OFF_ALBUM_DATA + sz * sz * 3] = pixel_bytes
+            shm_u32(OFF_SEQ, _album_write_seq)
             shm_u32(OFF_ALBUM_READY, 1)
+            _last_art_id = current_id
+            log.info(f"Album art written to SHM: {sz}x{sz}, seq={_album_write_seq}")
+        # same track — touch nothing
     else:
         shm_u32(OFF_ALBUM_READY, 0)
 
-    shm_u32(OFF_SEQ,   ui['seq'])
     shm_u32(OFF_MAGIC, MAGIC_VAL)
 
 
