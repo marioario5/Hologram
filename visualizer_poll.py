@@ -76,30 +76,17 @@ SPI PACKET PROTOCOL
 import os, time, random, struct, mmap, threading
 import subprocess, queue, sqlite3, logging, requests
 import numpy as np
-
-# Platform detection for cross-compatibility
-IS_WINDOWS = os.name == 'nt'
-IS_LINUX = os.name == 'posix'
-
-try:
-    import spidev
-    SPI_AVAILABLE = True
-except ImportError:
-    SPI_AVAILABLE = False
-    if IS_LINUX:
-        print("Warning: spidev not available on Linux (install with: sudo apt install python3-spidev)")
-    else:
-        print("Warning: spidev not available (expected on non-Raspberry Pi systems)")
+import spidev
 from io import BytesIO
 from colorthief import ColorThief
 from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from PIL import Image
-from flask import Flask, jsonify, abort, request, render_template
+from flask import Flask, jsonify, abort
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.WARNING,
+logging.basicConfig(level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 log = logging.getLogger('hologram')
 
@@ -116,15 +103,15 @@ SPI_SPEED_HZ = 4_000_000
 DISPLAY_W  = 1024
 DISPLAY_H  = 600
 NUM_BANDS  = 16
-ALBUM_SIZE = 180
+ALBUM_SIZE = 350
 FLASK_PORT = 5000
 
 SAMPLE_RATE   = 22050
 CAPTURE_SECS  = 15
 CAPTURE_BYTES = SAMPLE_RATE * 2 * CAPTURE_SECS   # s16le mono
 
-DB_PATH = '/home/marioario/fingerprints.db'
-ART_DIR = '/home/marioario/album_art/'
+DB_PATH = '/home/pi/fingerprints.db'
+ART_DIR = '/home/pi/album_art/'
 
 # Noise gate: ESP32 sends normalised RMS (0–255) in PKT_STATUS[1].
 # Below this, no audio is collected and ffmpeg is never invoked.
@@ -152,8 +139,8 @@ MODE_SPOTIFY = 0x00
 MODE_VINYL   = 0x01
 
 # ── Shared memory layout (must match C renderer) ──────────────────────────────
-SHM_PATH  = "/tmp/hologram.shm" if IS_LINUX else os.path.join(os.getcwd(), "hologram.shm")
-SHM_SIZE  = 128 * 1024
+SHM_PATH  = "/tmp/hologram.shm"
+SHM_SIZE  = 512 * 1024
 MAGIC_VAL = 0xDEADBEEF
 
 OFF_MAGIC        = 0
@@ -170,17 +157,21 @@ OFF_PLASMA_ABCD  = 156   # 4 × float32
 OFF_PLASMA_CXCY  = 172   # 2 × float32
 OFF_STALA_COLORS = 180   # 7 × float32
 OFF_ALBUM_READY  = 208
-OFF_ALBUM_DATA   = 212
+OFF_ALBUM_DATA   = 212    # 350*350*3 = 367500 bytes
+
+OFF_TRACK_TITLE   = 367712  # 64 bytes
+OFF_TRACK_ARTIST  = 367776  # 64 bytes
+OFF_TRACK_ALBUM_S = 367840  # 64 bytes
+OFF_TRACK_DUR_MS  = 367904  # uint32
+OFF_TRACK_POS_MS  = 367908  # uint32
+OFF_DISPLAY_MODE  = 367912  # uint32: 0=plasma 1=info
+OFF_POS_UPDATED   = 367916  # uint32 rolling counter
 
 # ── Shared memory ─────────────────────────────────────────────────────────────
 def open_shm():
     fd = os.open(SHM_PATH, os.O_CREAT | os.O_RDWR, 0o666)
     os.ftruncate(fd, SHM_SIZE)
-    # Platform-specific mmap calls
-    if IS_LINUX:
-        m = mmap.mmap(fd, SHM_SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
-    else:
-        m = mmap.mmap(fd, SHM_SIZE)
+    m = mmap.mmap(fd, SHM_SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
     os.close(fd)
     return m
 
@@ -206,8 +197,8 @@ def _blank_display_state():
         b  = random.uniform(.1, .4),
         c  = random.uniform(.4, .8),
         d  = random.uniform(.05, .2),
-        cx = random.uniform(np.pi * 0.4, np.pi * 1.6),  # keep center away from edges
-        cy = random.uniform(np.pi * 0.4, np.pi * 1.6),
+        cx = random.uniform(0, np.pi * 2),
+        cy = random.uniform(0, np.pi * 2),
     )
 
 # Spotify-owned display state — written only by spotify_thread()
@@ -232,6 +223,7 @@ ui_state = dict(
     bands             = [128] * NUM_BANDS,
     stalagmite_colors = [0.0] * 7,
     seq               = 0,
+    display_mode      = 0,   # 0=minimal plasma, 1=info display
 )
 ui_state_lock = threading.Lock()
 
@@ -267,8 +259,8 @@ def new_plasma_params():
         b  = random.uniform(.1, .4),
         c  = random.uniform(.4, .8),
         d  = random.uniform(.05, .2),
-        cx = random.uniform(np.pi * 0.4, np.pi * 1.6),  # keep center away from edges
-        cy = random.uniform(np.pi * 0.4, np.pi * 1.6),
+        cx = random.uniform(0, np.pi * 2),
+        cy = random.uniform(0, np.pi * 2),
     )
 
 def extract_palette(img_bytes, n=5):
@@ -355,10 +347,6 @@ parser = PacketParser()
 
 def spi_thread():
     global active_mode, vinyl_track_start_time, vinyl_track_duration_ms
-
-    if not SPI_AVAILABLE:
-        log.warning("SPI not available, spi_thread exiting")
-        return
 
     try:
         spi = spidev.SpiDev()
@@ -610,11 +598,9 @@ def _learn_thread():
         def _fetch_spotify():
             try:
                 sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
-                client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
-                redirect_uri=REDIRECT_URL, scope="user-read-currently-playing user-read-playback-state",
-                open_browser=False,
-                cache_path='/home/marioario/.spotify_cache'))
-                pb = sp.current_playback()
+                    client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
+                    redirect_uri=REDIRECT_URL, scope="user-read-currently-playing"))
+                pb = sp.current_user_playing_track()
                 if not pb or not pb.get('item'):
                     spotify_error[0] = "Nothing playing on Spotify"
                     return
@@ -740,21 +726,21 @@ def spotify_thread():
     """
     try:
         sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
-        client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
-        redirect_uri=REDIRECT_URL, scope="user-read-currently-playing user-read-playback-state",
-        open_browser=False,
-        cache_path='/home/marioario/.spotify_cache'))
+            client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
+            redirect_uri=REDIRECT_URL, scope="user-read-currently-playing"))
     except Exception as e:
         log.error(f"Spotify auth failed: {e}")
         return
 
-    poll_interval = 2
     while True:
         with active_mode_lock:
             mode = active_mode
+
         if mode == MODE_VINYL:
+            # Vinyl active — sleep, do not touch any state
             time.sleep(2)
             continue
+
         try:
             pb = sp.current_playback()
             if pb and pb.get('is_playing') and pb.get('item'):
@@ -770,11 +756,21 @@ def spotify_thread():
                         spotify_state['album_art_bytes'] = img
                         spotify_state['palette']         = extract_palette(img)
                         spotify_state.update(new_plasma_params())
-                    poll_interval = 1  # poll faster right after a change
+                        spotify_state['track_title']      = item['name']
+                        spotify_state['track_artist']     = item['artists'][0]['name']
+                        spotify_state['track_album']      = item['album']['name']
+                        spotify_state['track_dur_ms']     = item['duration_ms']
+                        spotify_state['track_pos_ms']     = pb.get('progress_ms', 0)
+                        spotify_state['_pos_fetched_at']  = time.time()
+                    poll_interval = 1
                 else:
-                    poll_interval = 2  # back to normal
+                    with spotify_state_lock:
+                        spotify_state['track_pos_ms']    = pb.get('progress_ms', 0)
+                        spotify_state['_pos_fetched_at'] = time.time()
+                    poll_interval = 2
         except Exception as e:
             log.warning(f"Spotify poll error: {e}")
+
         time.sleep(poll_interval)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -788,12 +784,7 @@ def stalagmite_thread():
 # SHM WRITER — picks the correct state based on active mode, never mixes them
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-_last_art_id     = None
-_album_write_seq = 0
-
 def _write_shm():
-    global _last_art_id, _album_write_seq   # both need global
-
     with active_mode_lock:
         mode = active_mode
 
@@ -806,6 +797,8 @@ def _write_shm():
 
     with ui_state_lock:
         ui = dict(ui_state)
+        ui['seq'] = (ui['seq'] + 1) & 0xFFFFFFFF
+        ui_state['seq'] = ui['seq']
 
     shm_f32s(OFF_BANDS, [float(b) for b in ui['bands']])
     for i, c in enumerate(ds['palette']):
@@ -820,27 +813,45 @@ def _write_shm():
     shm_u32(OFF_BPM,        ui['bpm'])
 
     if ds['album_art_bytes']:
-        current_id = ds.get('last_track_id')
-        if current_id != _last_art_id:
-            # do ALL slow work before touching SHM flags
-            ds['album_art_bytes'].seek(0)
-            sz = ui['album_size']
-            img = (Image.open(ds['album_art_bytes'])
-                   .convert('RGB')
-                   .resize((sz, sz), Image.LANCZOS))
-            pixel_bytes = img.tobytes()
-
-            _album_write_seq = (_album_write_seq + 1) & 0xFFFFFFFF
-            shm_u32(OFF_ALBUM_READY, 0)
-            shm_u32(OFF_ALBUM_SIZE, sz)
-            shm[OFF_ALBUM_DATA : OFF_ALBUM_DATA + sz * sz * 3] = pixel_bytes
-            shm_u32(OFF_SEQ, _album_write_seq)
-            shm_u32(OFF_ALBUM_READY, 1)
-            _last_art_id = current_id
-            log.info(f"Album art written to SHM: {sz}x{sz}, seq={_album_write_seq}")
-        # same track — touch nothing
+        ds['album_art_bytes'].seek(0)
+        sz  = ui['album_size']
+        img = (Image.open(ds['album_art_bytes'])
+               .convert('RGB')
+               .resize((sz, sz), Image.LANCZOS))
+        shm[OFF_ALBUM_DATA : OFF_ALBUM_DATA + sz * sz * 3] = img.tobytes()
+        shm_u32(OFF_ALBUM_READY, 1)
     else:
         shm_u32(OFF_ALBUM_READY, 0)
+
+    shm_u32(OFF_SEQ,   ui['seq'])
+    # ── Track info for info display mode ──────────────────────────────────
+    if mode == MODE_VINYL:
+        with vinyl_state_lock:
+            tid2 = vinyl_state.get('last_track_id') or ''
+    else:
+        with spotify_state_lock:
+            tid2 = spotify_state.get('last_track_id') or ''
+
+    title_bytes  = ds.get('track_title',  '').encode('ascii', 'replace')[:63].ljust(64, b'\x00')
+    artist_bytes = ds.get('track_artist', '').encode('ascii', 'replace')[:63].ljust(64, b'\x00')
+    album_bytes  = ds.get('track_album',  '').encode('ascii', 'replace')[:63].ljust(64, b'\x00')
+    shm[OFF_TRACK_TITLE  : OFF_TRACK_TITLE  + 64] = title_bytes
+    shm[OFF_TRACK_ARTIST : OFF_TRACK_ARTIST + 64] = artist_bytes
+    shm[OFF_TRACK_ALBUM_S: OFF_TRACK_ALBUM_S + 64] = album_bytes
+    shm_u32(OFF_TRACK_DUR_MS, ds.get('track_dur_ms', 0))
+    # interpolate position between Spotify polls
+    base_pos   = ds.get('track_pos_ms', 0)
+    fetched_at = ds.get('_pos_fetched_at', 0)
+    if fetched_at > 0:
+        elapsed_since = time.time() - fetched_at
+        estimated_pos = int(base_pos + elapsed_since * 1000)
+        dur = ds.get('track_dur_ms', 0)
+        if dur > 0 and estimated_pos > dur:
+            estimated_pos = dur
+    else:
+        estimated_pos = base_pos
+    shm_u32(OFF_TRACK_POS_MS, estimated_pos)
+    shm_u32(OFF_DISPLAY_MODE, ui.get('display_mode', 0))
 
     shm_u32(OFF_MAGIC, MAGIC_VAL)
 
@@ -857,31 +868,29 @@ def shm_loop():
 app = Flask(__name__)
 
 
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-
 @app.route('/status')
 def route_status():
     with active_mode_lock:
         mode = active_mode
     with ui_state_lock:
         bpm = ui_state['bpm']
-        visualizer_mode = ui_state['mode']
     if mode == MODE_VINYL:
         with vinyl_state_lock:
             track = vinyl_state['last_track_id']
     else:
         with spotify_state_lock:
             track = spotify_state['last_track_id']
+    with ui_state_lock:
+        visualizer_mode = ui_state['mode']
+        display_mode    = ui_state['display_mode']
     return jsonify(dict(
-        mode           = 'vinyl' if mode == MODE_VINYL else 'spotify',
-        track          = track,
-        bpm            = bpm,
-        learning       = is_learning,
-        fingerprinting = is_fingerprinting,
+        mode            = 'vinyl' if mode == MODE_VINYL else 'spotify',
+        track           = track,
+        bpm             = bpm,
+        learning        = is_learning,
+        fingerprinting  = is_fingerprinting,
         visualizer_mode = visualizer_mode,
+        display_mode    = display_mode,
     ))
 
 
@@ -898,16 +907,30 @@ def route_learn():
 
 @app.route('/mode', methods=['POST'])
 def route_mode():
-    """Toggle between plasma and stalagmite visualizer modes."""
+    """Toggle between plasma and stalagmite visualizer styles."""
     data = request.get_json()
     if not data or 'mode' not in data:
-        abort(400, description="Missing 'mode' field in JSON body.")
+        abort(400, description="Missing 'mode' field.")
     new_mode = data['mode']
     if new_mode not in ['plasma', 'stalagmite']:
         abort(400, description="Mode must be 'plasma' or 'stalagmite'.")
     with ui_state_lock:
         ui_state['mode'] = new_mode
-    return jsonify({'status': f'Visualizer mode set to {new_mode}.'})
+    return jsonify({'status': f'Visualizer style set to {new_mode}.'})
+
+
+@app.route('/display', methods=['POST'])
+def route_display():
+    """Toggle between minimal plasma (0) and info display (1)."""
+    data = request.get_json()
+    if not data or 'display_mode' not in data:
+        abort(400, description="Missing 'display_mode' field.")
+    dm = int(data['display_mode'])
+    if dm not in [0, 1]:
+        abort(400, description="display_mode must be 0 or 1.")
+    with ui_state_lock:
+        ui_state['display_mode'] = dm
+    return jsonify({'status': f'Display mode set to {"info" if dm else "plasma"}.'})
 
 
 def flask_thread():

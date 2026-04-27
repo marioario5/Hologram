@@ -21,94 +21,57 @@
             padding: 20px;
             border-radius: 5px;
         }
-        h1 {
-            text-align: center;
-            color: #0f0;
-            margin-bottom: 30px;
-            text-shadow: 0 0 10px #0f0;
-        }
+        h1 { text-align: center; color: #0f0; margin-bottom: 30px; text-shadow: 0 0 10px #0f0; }
         .status {
-            background: #222;
-            border: 1px solid #333;
-            padding: 15px;
-            margin-bottom: 20px;
-            border-radius: 3px;
-            font-size: 14px;
-            line-height: 1.6;
+            background: #222; border: 1px solid #333;
+            padding: 15px; margin-bottom: 20px;
+            border-radius: 3px; font-size: 14px; line-height: 1.6;
         }
-        .control {
-            margin-bottom: 20px;
-        }
-        .control h3 {
-            margin: 0 0 10px 0;
-            color: #0f0;
-        }
+        .control { margin-bottom: 20px; }
+        .control h3 { margin: 0 0 10px 0; color: #0f0; }
         button {
-            background: #0f0;
-            color: #000;
-            border: none;
-            padding: 10px 20px;
-            font-size: 16px;
-            font-family: inherit;
-            cursor: pointer;
-            border-radius: 3px;
-            width: 100%;
-            margin-bottom: 10px;
+            background: #0f0; color: #000; border: none;
+            padding: 10px 20px; font-size: 16px;
+            font-family: inherit; cursor: pointer;
+            border-radius: 3px; width: 100%; margin-bottom: 10px;
         }
-        button:hover {
-            background: #0a0;
-        }
-        button:disabled {
-            background: #333;
-            color: #666;
-            cursor: not-allowed;
-        }
-        .toggle {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 10px;
-            font-size: 16px;
-        }
-        .toggle input { width: 50px; height: 25px; }
+        button:hover { background: #0a0; }
+        button:disabled { background: #333; color: #666; cursor: not-allowed; }
+        .toggle { display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 16px; }
         .switch { position: relative; display: inline-block; width: 50px; height: 25px; }
         .switch input { opacity: 0; width: 0; height: 0; }
-        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 25px; }
-        .slider:before { position: absolute; content: ""; height: 19px; width: 19px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }
-        input:checked + .slider { background-color: #007bff; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #333; transition: .4s; border-radius: 25px; }
+        .slider:before { position: absolute; content: ""; height: 19px; width: 19px; left: 3px; bottom: 3px; background-color: #0f0; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: #005500; }
         input:checked + .slider:before { transform: translateX(25px); }
-        .message {
-            padding: 10px;
-            margin-top: 10px;
-            border-radius: 3px;
-            text-align: center;
-            font-weight: bold;
-        }
-        .message.success {
-            background: #0a0;
-            color: #000;
-        }
-        .message.error {
-            background: #a00;
-            color: #fff;
-        }
+        .message { padding: 10px; margin-top: 10px; border-radius: 3px; text-align: center; font-weight: bold; }
+        .message.success { background: #0a0; color: #000; }
+        .message.error { background: #a00; color: #fff; }
+        .divider { border: none; border-top: 1px solid #333; margin: 15px 0; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🎵 Hologram Visualizer Control 🎵</h1>
 
-        <div class="status" id="status">
-            Loading status...
-        </div>
+        <div class="status" id="status">Loading status...</div>
 
         <div class="control">
-            <h3>Fingerprint Learning</h3>
-            <button id="learnBtn" onclick="learnTrack()">🎵 Learn Current Track</button>
+            <h3>Display Mode</h3>
+            <div class="toggle">
+                <span>Plasma</span>
+                <label class="switch">
+                    <input type="checkbox" id="displayToggle" onchange="toggleDisplay()">
+                    <span class="slider"></span>
+                </label>
+                <span>Info</span>
+            </div>
         </div>
 
+        <hr class="divider">
+
         <div class="control">
-            <h3>Visualizer Mode</h3>
+            <h3>Visualizer Style</h3>
             <div class="toggle">
                 <span>Plasma</span>
                 <label class="switch">
@@ -119,60 +82,69 @@
             </div>
         </div>
 
+        <hr class="divider">
+
+        <div class="control">
+            <h3>Fingerprint Learning</h3>
+            <button id="learnBtn" onclick="learnTrack()">🎵 Learn Current Track</button>
+        </div>
+
         <div id="message"></div>
     </div>
 
     <script>
         async function updateStatus() {
             try {
-                const response = await fetch('/status');
-                const data = await response.json();
-                document.getElementById('status').innerHTML = `
-                    <strong>Input Mode:</strong> ${data.mode}<br>
-                    <strong>Current Track:</strong> ${data.track || 'None'}<br>
-                    <strong>BPM:</strong> ${data.bpm}<br>
-                    <strong>Visualizer:</strong> ${data.visualizer_mode}<br>
-                    <strong>Learning:</strong> ${data.learning ? 'Active' : 'Inactive'}<br>
-                    <strong>Fingerprinting:</strong> ${data.fingerprinting ? 'Active' : 'Inactive'}
-                `;
-                document.getElementById('modeToggle').checked = data.visualizer_mode === 'stalagmite';
-                document.getElementById('learnBtn').disabled = data.mode !== 'vinyl';
-            } catch (error) {
+                const r = await fetch('/status');
+                const d = await r.json();
+                document.getElementById('status').innerHTML =
+                    `<strong>Input Mode:</strong> ${d.mode}<br>
+                     <strong>Current Track:</strong> ${d.track || 'None'}<br>
+                     <strong>BPM:</strong> ${d.bpm}<br>
+                     <strong>Visualizer Style:</strong> ${d.visualizer_mode}<br>
+                     <strong>Display Mode:</strong> ${d.display_mode === 1 ? 'Info' : 'Plasma'}<br>
+                     <strong>Learning:</strong> ${d.learning ? 'Active' : 'Inactive'}<br>
+                     <strong>Fingerprinting:</strong> ${d.fingerprinting ? 'Active' : 'Inactive'}`;
+                document.getElementById('modeToggle').checked = d.visualizer_mode === 'stalagmite';
+                document.getElementById('displayToggle').checked = d.display_mode === 1;
+                document.getElementById('learnBtn').disabled = d.mode !== 'vinyl';
+            } catch (e) {
                 document.getElementById('status').innerHTML = 'Error loading status';
             }
         }
 
-        async function learnTrack() {
+        async function toggleDisplay() {
+            const dm = document.getElementById('displayToggle').checked ? 1 : 0;
             try {
-                const response = await fetch('/learn', { method: 'POST' });
-                const data = await response.json();
-                if (response.ok) {
-                    showMessage(data.status, 'success');
-                } else {
-                    showMessage(data.description || 'Error', 'error');
-                }
-            } catch (error) {
-                showMessage('Network error', 'error');
-            }
+                const r = await fetch('/display', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({display_mode: dm})
+                });
+                const d = await r.json();
+                showMessage(d.status, r.ok ? 'success' : 'error');
+            } catch (e) { showMessage('Network error', 'error'); }
         }
 
         async function toggleMode() {
             const mode = document.getElementById('modeToggle').checked ? 'stalagmite' : 'plasma';
             try {
-                const response = await fetch('/mode', {
+                const r = await fetch('/mode', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ mode: mode })
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({mode})
                 });
-                const data = await response.json();
-                if (response.ok) {
-                    showMessage(data.status, 'success');
-                } else {
-                    showMessage(data.description || 'Error', 'error');
-                }
-            } catch (error) {
-                showMessage('Network error', 'error');
-            }
+                const d = await r.json();
+                showMessage(d.status, r.ok ? 'success' : 'error');
+            } catch (e) { showMessage('Network error', 'error'); }
+        }
+
+        async function learnTrack() {
+            try {
+                const r = await fetch('/learn', {method: 'POST'});
+                const d = await r.json();
+                showMessage(d.status || d.description, r.ok ? 'success' : 'error');
+            } catch (e) { showMessage('Network error', 'error'); }
         }
 
         function showMessage(text, type) {
@@ -181,7 +153,6 @@
             setTimeout(() => msg.innerHTML = '', 5000);
         }
 
-        // Update status every 2 seconds
         updateStatus();
         setInterval(updateStatus, 2000);
     </script>
