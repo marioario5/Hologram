@@ -76,14 +76,19 @@ SPI PACKET PROTOCOL
 import os, time, random, struct, mmap, threading
 import subprocess, queue, sqlite3, logging, requests
 import numpy as np
-import spidev
+try:
+    import spidev
+    SPI_AVAILABLE = True
+except ImportError:
+    SPI_AVAILABLE = False
+    print("Warning: spidev not available (expected on non-Raspberry Pi systems)")
 from io import BytesIO
 from colorthief import ColorThief
 from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from PIL import Image
-from flask import Flask, jsonify, abort
+from flask import Flask, jsonify, abort, request
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO,
@@ -139,7 +144,7 @@ MODE_SPOTIFY = 0x00
 MODE_VINYL   = 0x01
 
 # ── Shared memory layout (must match C renderer) ──────────────────────────────
-SHM_PATH  = "/tmp/hologram.shm"
+SHM_PATH  = os.path.join(os.getcwd(), "hologram.shm")
 SHM_SIZE  = 128 * 1024
 MAGIC_VAL = 0xDEADBEEF
 
@@ -163,7 +168,11 @@ OFF_ALBUM_DATA   = 212
 def open_shm():
     fd = os.open(SHM_PATH, os.O_CREAT | os.O_RDWR, 0o666)
     os.ftruncate(fd, SHM_SIZE)
-    m = mmap.mmap(fd, SHM_SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    # Cross-platform mmap: Windows doesn't use MAP_SHARED/PROT flags
+    if hasattr(mmap, 'MAP_SHARED'):
+        m = mmap.mmap(fd, SHM_SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    else:
+        m = mmap.mmap(fd, SHM_SIZE)
     os.close(fd)
     return m
 
@@ -338,6 +347,10 @@ parser = PacketParser()
 
 def spi_thread():
     global active_mode, vinyl_track_start_time, vinyl_track_duration_ms
+
+    if not SPI_AVAILABLE:
+        log.warning("SPI not available, spi_thread exiting")
+        return
 
     try:
         spi = spidev.SpiDev()
@@ -767,7 +780,12 @@ def stalagmite_thread():
 # SHM WRITER — picks the correct state based on active mode, never mixes them
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+_last_art_id     = None
+_album_write_seq = 0
+
 def _write_shm():
+    global _last_art_id, _album_write_seq   # both need global
+
     with active_mode_lock:
         mode = active_mode
 
@@ -780,8 +798,6 @@ def _write_shm():
 
     with ui_state_lock:
         ui = dict(ui_state)
-        ui['seq'] = (ui['seq'] + 1) & 0xFFFFFFFF
-        ui_state['seq'] = ui['seq']
 
     shm_f32s(OFF_BANDS, [float(b) for b in ui['bands']])
     for i, c in enumerate(ds['palette']):
@@ -796,18 +812,28 @@ def _write_shm():
     shm_u32(OFF_BPM,        ui['bpm'])
 
     if ds['album_art_bytes']:
-        shm_u32(OFF_ALBUM_READY, 0)  # mark not ready BEFORE writing
-        ds['album_art_bytes'].seek(0)
-        sz  = ui['album_size']
-        img = (Image.open(ds['album_art_bytes'])
-           .convert('RGB')
-           .resize((sz, sz), Image.LANCZOS))
-        shm[OFF_ALBUM_DATA : OFF_ALBUM_DATA + sz * sz * 3] = img.tobytes()
-        shm_u32(OFF_ALBUM_READY, 1)  # mark ready AFTER
+        current_id = ds.get('last_track_id')
+        if current_id != _last_art_id:
+            # do ALL slow work before touching SHM flags
+            ds['album_art_bytes'].seek(0)
+            sz = ui['album_size']
+            img = (Image.open(ds['album_art_bytes'])
+                   .convert('RGB')
+                   .resize((sz, sz), Image.LANCZOS))
+            pixel_bytes = img.tobytes()
+
+            _album_write_seq = (_album_write_seq + 1) & 0xFFFFFFFF
+            shm_u32(OFF_ALBUM_READY, 0)
+            shm_u32(OFF_ALBUM_SIZE, sz)
+            shm[OFF_ALBUM_DATA : OFF_ALBUM_DATA + sz * sz * 3] = pixel_bytes
+            shm_u32(OFF_SEQ, _album_write_seq)
+            shm_u32(OFF_ALBUM_READY, 1)
+            _last_art_id = current_id
+            log.info(f"Album art written to SHM: {sz}x{sz}, seq={_album_write_seq}")
+        # same track — touch nothing
     else:
         shm_u32(OFF_ALBUM_READY, 0)
 
-    shm_u32(OFF_SEQ,   ui['seq'])
     shm_u32(OFF_MAGIC, MAGIC_VAL)
 
 
@@ -823,12 +849,138 @@ def shm_loop():
 app = Flask(__name__)
 
 
+@app.route('/')
+def index():
+    return '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Hologram Visualizer Control</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; background: #111; color: #fff; }
+        .container { max-width: 600px; margin: 0 auto; }
+        .status { background: #222; padding: 20px; border-radius: 8px; margin: 20px 0; }
+        .control { margin: 20px 0; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 16px; }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #666; cursor: not-allowed; }
+        .toggle { display: flex; align-items: center; gap: 10px; }
+        .toggle input { width: 50px; height: 25px; }
+        .switch { position: relative; display: inline-block; width: 50px; height: 25px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 25px; }
+        .slider:before { position: absolute; content: ""; height: 19px; width: 19px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: #007bff; }
+        input:checked + .slider:before { transform: translateX(25px); }
+        .message { margin: 10px 0; padding: 10px; border-radius: 4px; }
+        .success { background: #28a745; }
+        .error { background: #dc3545; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Hologram Visualizer Control</h1>
+        
+        <div class="status" id="status">
+            Loading status...
+        </div>
+        
+        <div class="control">
+            <h3>Learning Mode</h3>
+            <button id="learnBtn" onclick="learnTrack()">Learn Current Track</button>
+            <p>Only works in vinyl mode. Plays for 15 seconds to capture fingerprint.</p>
+        </div>
+        
+        <div class="control">
+            <h3>Visualizer Mode</h3>
+            <div class="toggle">
+                <span>Plasma</span>
+                <label class="switch">
+                    <input type="checkbox" id="modeToggle" onchange="toggleMode()">
+                    <span class="slider"></span>
+                </label>
+                <span>Stalagmite</span>
+            </div>
+        </div>
+        
+        <div id="message"></div>
+    </div>
+
+    <script>
+        async function updateStatus() {
+            try {
+                const response = await fetch('/status');
+                const data = await response.json();
+                document.getElementById('status').innerHTML = `
+                    <strong>Input Mode:</strong> ${data.mode}<br>
+                    <strong>Current Track:</strong> ${data.track || 'None'}<br>
+                    <strong>BPM:</strong> ${data.bpm}<br>
+                    <strong>Visualizer:</strong> ${data.visualizer_mode}<br>
+                    <strong>Learning:</strong> ${data.learning ? 'Active' : 'Inactive'}<br>
+                    <strong>Fingerprinting:</strong> ${data.fingerprinting ? 'Active' : 'Inactive'}
+                `;
+                document.getElementById('modeToggle').checked = data.visualizer_mode === 'stalagmite';
+                document.getElementById('learnBtn').disabled = data.mode !== 'vinyl';
+            } catch (error) {
+                document.getElementById('status').innerHTML = 'Error loading status';
+            }
+        }
+
+        async function learnTrack() {
+            try {
+                const response = await fetch('/learn', { method: 'POST' });
+                const data = await response.json();
+                if (response.ok) {
+                    showMessage(data.status, 'success');
+                } else {
+                    showMessage(data.description || 'Error', 'error');
+                }
+            } catch (error) {
+                showMessage('Network error', 'error');
+            }
+        }
+
+        async function toggleMode() {
+            const mode = document.getElementById('modeToggle').checked ? 'stalagmite' : 'plasma';
+            try {
+                const response = await fetch('/mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode: mode })
+                });
+                const data = await response.json();
+                if (response.ok) {
+                    showMessage(data.status, 'success');
+                } else {
+                    showMessage(data.description || 'Error', 'error');
+                }
+            } catch (error) {
+                showMessage('Network error', 'error');
+            }
+        }
+
+        function showMessage(text, type) {
+            const msg = document.getElementById('message');
+            msg.innerHTML = `<div class="message ${type}">${text}</div>`;
+            setTimeout(() => msg.innerHTML = '', 5000);
+        }
+
+        // Update status every 2 seconds
+        updateStatus();
+        setInterval(updateStatus, 2000);
+    </script>
+</body>
+</html>
+'''
+
+
 @app.route('/status')
 def route_status():
     with active_mode_lock:
         mode = active_mode
     with ui_state_lock:
         bpm = ui_state['bpm']
+        visualizer_mode = ui_state['mode']
     if mode == MODE_VINYL:
         with vinyl_state_lock:
             track = vinyl_state['last_track_id']
@@ -841,6 +993,7 @@ def route_status():
         bpm            = bpm,
         learning       = is_learning,
         fingerprinting = is_fingerprinting,
+        visualizer_mode = visualizer_mode,
     ))
 
 
@@ -853,6 +1006,20 @@ def route_learn():
         abort(409, description="Must be in vinyl mode to learn a track.")
     _start_learn("Flask /learn")
     return jsonify({'status': 'Learning started — capturing audio now...'})
+
+
+@app.route('/mode', methods=['POST'])
+def route_mode():
+    """Toggle between plasma and stalagmite visualizer modes."""
+    data = request.get_json()
+    if not data or 'mode' not in data:
+        abort(400, description="Missing 'mode' field in JSON body.")
+    new_mode = data['mode']
+    if new_mode not in ['plasma', 'stalagmite']:
+        abort(400, description="Mode must be 'plasma' or 'stalagmite'.")
+    with ui_state_lock:
+        ui_state['mode'] = new_mode
+    return jsonify({'status': f'Visualizer mode set to {new_mode}.'})
 
 
 def flask_thread():

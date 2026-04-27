@@ -76,17 +76,30 @@ SPI PACKET PROTOCOL
 import os, time, random, struct, mmap, threading
 import subprocess, queue, sqlite3, logging, requests
 import numpy as np
-import spidev
+
+# Platform detection for cross-compatibility
+IS_WINDOWS = os.name == 'nt'
+IS_LINUX = os.name == 'posix'
+
+try:
+    import spidev
+    SPI_AVAILABLE = True
+except ImportError:
+    SPI_AVAILABLE = False
+    if IS_LINUX:
+        print("Warning: spidev not available on Linux (install with: sudo apt install python3-spidev)")
+    else:
+        print("Warning: spidev not available (expected on non-Raspberry Pi systems)")
 from io import BytesIO
 from colorthief import ColorThief
 from dotenv import load_dotenv
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from PIL import Image
-from flask import Flask, jsonify, abort
+from flask import Flask, jsonify, abort, request, render_template
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO,
+logging.basicConfig(level=logging.WARNING,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 log = logging.getLogger('hologram')
 
@@ -139,7 +152,7 @@ MODE_SPOTIFY = 0x00
 MODE_VINYL   = 0x01
 
 # ── Shared memory layout (must match C renderer) ──────────────────────────────
-SHM_PATH  = "/tmp/hologram.shm"
+SHM_PATH  = "/tmp/hologram.shm" if IS_LINUX else os.path.join(os.getcwd(), "hologram.shm")
 SHM_SIZE  = 128 * 1024
 MAGIC_VAL = 0xDEADBEEF
 
@@ -163,7 +176,11 @@ OFF_ALBUM_DATA   = 212
 def open_shm():
     fd = os.open(SHM_PATH, os.O_CREAT | os.O_RDWR, 0o666)
     os.ftruncate(fd, SHM_SIZE)
-    m = mmap.mmap(fd, SHM_SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    # Platform-specific mmap calls
+    if IS_LINUX:
+        m = mmap.mmap(fd, SHM_SIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    else:
+        m = mmap.mmap(fd, SHM_SIZE)
     os.close(fd)
     return m
 
@@ -338,6 +355,10 @@ parser = PacketParser()
 
 def spi_thread():
     global active_mode, vinyl_track_start_time, vinyl_track_duration_ms
+
+    if not SPI_AVAILABLE:
+        log.warning("SPI not available, spi_thread exiting")
+        return
 
     try:
         spi = spidev.SpiDev()
@@ -836,12 +857,18 @@ def shm_loop():
 app = Flask(__name__)
 
 
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
 @app.route('/status')
 def route_status():
     with active_mode_lock:
         mode = active_mode
     with ui_state_lock:
         bpm = ui_state['bpm']
+        visualizer_mode = ui_state['mode']
     if mode == MODE_VINYL:
         with vinyl_state_lock:
             track = vinyl_state['last_track_id']
@@ -854,6 +881,7 @@ def route_status():
         bpm            = bpm,
         learning       = is_learning,
         fingerprinting = is_fingerprinting,
+        visualizer_mode = visualizer_mode,
     ))
 
 
@@ -866,6 +894,20 @@ def route_learn():
         abort(409, description="Must be in vinyl mode to learn a track.")
     _start_learn("Flask /learn")
     return jsonify({'status': 'Learning started — capturing audio now...'})
+
+
+@app.route('/mode', methods=['POST'])
+def route_mode():
+    """Toggle between plasma and stalagmite visualizer modes."""
+    data = request.get_json()
+    if not data or 'mode' not in data:
+        abort(400, description="Missing 'mode' field in JSON body.")
+    new_mode = data['mode']
+    if new_mode not in ['plasma', 'stalagmite']:
+        abort(400, description="Mode must be 'plasma' or 'stalagmite'.")
+    with ui_state_lock:
+        ui_state['mode'] = new_mode
+    return jsonify({'status': f'Visualizer mode set to {new_mode}.'})
 
 
 def flask_thread():

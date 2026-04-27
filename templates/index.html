@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hologram Visualizer Control</title>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            background: #000;
+            color: #0f0;
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background: #111;
+            border: 1px solid #0f0;
+            padding: 20px;
+            border-radius: 5px;
+        }
+        h1 {
+            text-align: center;
+            color: #0f0;
+            margin-bottom: 30px;
+            text-shadow: 0 0 10px #0f0;
+        }
+        .status {
+            background: #222;
+            border: 1px solid #333;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 3px;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .control {
+            margin-bottom: 20px;
+        }
+        .control h3 {
+            margin: 0 0 10px 0;
+            color: #0f0;
+        }
+        button {
+            background: #0f0;
+            color: #000;
+            border: none;
+            padding: 10px 20px;
+            font-size: 16px;
+            font-family: inherit;
+            cursor: pointer;
+            border-radius: 3px;
+            width: 100%;
+            margin-bottom: 10px;
+        }
+        button:hover {
+            background: #0a0;
+        }
+        button:disabled {
+            background: #333;
+            color: #666;
+            cursor: not-allowed;
+        }
+        .toggle {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            font-size: 16px;
+        }
+        .toggle input { width: 50px; height: 25px; }
+        .switch { position: relative; display: inline-block; width: 50px; height: 25px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 25px; }
+        .slider:before { position: absolute; content: ""; height: 19px; width: 19px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: #007bff; }
+        input:checked + .slider:before { transform: translateX(25px); }
+        .message {
+            padding: 10px;
+            margin-top: 10px;
+            border-radius: 3px;
+            text-align: center;
+            font-weight: bold;
+        }
+        .message.success {
+            background: #0a0;
+            color: #000;
+        }
+        .message.error {
+            background: #a00;
+            color: #fff;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎵 Hologram Visualizer Control 🎵</h1>
+
+        <div class="status" id="status">
+            Loading status...
+        </div>
+
+        <div class="control">
+            <h3>Fingerprint Learning</h3>
+            <button id="learnBtn" onclick="learnTrack()">🎵 Learn Current Track</button>
+        </div>
+
+        <div class="control">
+            <h3>Visualizer Mode</h3>
+            <div class="toggle">
+                <span>Plasma</span>
+                <label class="switch">
+                    <input type="checkbox" id="modeToggle" onchange="toggleMode()">
+                    <span class="slider"></span>
+                </label>
+                <span>Stalagmite</span>
+            </div>
+        </div>
+
+        <div id="message"></div>
+    </div>
+
+    <script>
+        async function updateStatus() {
+            try {
+                const response = await fetch('/status');
+                const data = await response.json();
+                document.getElementById('status').innerHTML = `
+                    <strong>Input Mode:</strong> ${data.mode}<br>
+                    <strong>Current Track:</strong> ${data.track || 'None'}<br>
+                    <strong>BPM:</strong> ${data.bpm}<br>
+                    <strong>Visualizer:</strong> ${data.visualizer_mode}<br>
+                    <strong>Learning:</strong> ${data.learning ? 'Active' : 'Inactive'}<br>
+                    <strong>Fingerprinting:</strong> ${data.fingerprinting ? 'Active' : 'Inactive'}
+                `;
+                document.getElementById('modeToggle').checked = data.visualizer_mode === 'stalagmite';
+                document.getElementById('learnBtn').disabled = data.mode !== 'vinyl';
+            } catch (error) {
+                document.getElementById('status').innerHTML = 'Error loading status';
+            }
+        }
+
+        async function learnTrack() {
+            try {
+                const response = await fetch('/learn', { method: 'POST' });
+                const data = await response.json();
+                if (response.ok) {
+                    showMessage(data.status, 'success');
+                } else {
+                    showMessage(data.description || 'Error', 'error');
+                }
+            } catch (error) {
+                showMessage('Network error', 'error');
+            }
+        }
+
+        async function toggleMode() {
+            const mode = document.getElementById('modeToggle').checked ? 'stalagmite' : 'plasma';
+            try {
+                const response = await fetch('/mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode: mode })
+                });
+                const data = await response.json();
+                if (response.ok) {
+                    showMessage(data.status, 'success');
+                } else {
+                    showMessage(data.description || 'Error', 'error');
+                }
+            } catch (error) {
+                showMessage('Network error', 'error');
+            }
+        }
+
+        function showMessage(text, type) {
+            const msg = document.getElementById('message');
+            msg.innerHTML = `<div class="message ${type}">${text}</div>`;
+            setTimeout(() => msg.innerHTML = '', 5000);
+        }
+
+        // Update status every 2 seconds
+        updateStatus();
+        setInterval(updateStatus, 2000);
+    </script>
+</body>
+</html>
