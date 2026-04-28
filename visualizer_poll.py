@@ -110,8 +110,8 @@ SAMPLE_RATE   = 22050
 CAPTURE_SECS  = 15
 CAPTURE_BYTES = SAMPLE_RATE * 2 * CAPTURE_SECS   # s16le mono
 
-DB_PATH = '/home/pi/fingerprints.db'
-ART_DIR = '/home/pi/album_art/'
+DB_PATH = '/home/marioario/fingerprints.db'
+ART_DIR = '/home/marioario/album_art/'
 
 # Noise gate: ESP32 sends normalised RMS (0–255) in PKT_STATUS[1].
 # Below this, no audio is collected and ffmpeg is never invoked.
@@ -361,6 +361,7 @@ def spi_thread():
     prev_mode  = MODE_SPOTIFY
     audio_live = False   # True only when vinyl + above noise gate
 
+    poll_interval = 2
     while True:
         now = time.time()
         if now - last_poll < 0.05:
@@ -727,11 +728,15 @@ def spotify_thread():
     try:
         sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
             client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
-            redirect_uri=REDIRECT_URL, scope="user-read-currently-playing"))
+            redirect_uri=REDIRECT_URL,
+            scope="user-read-currently-playing user-read-playback-state",
+            open_browser=False,
+            cache_path='/home/marioario/.spotify_cache'))
     except Exception as e:
         log.error(f"Spotify auth failed: {e}")
         return
 
+    poll_interval = 2
     while True:
         with active_mode_lock:
             mode = active_mode
@@ -743,30 +748,35 @@ def spotify_thread():
 
         try:
             pb = sp.current_playback()
-            if pb and pb.get('is_playing') and pb.get('item'):
+            if pb and pb.get('item'):
                 item = pb['item']
                 tid  = item['id']
+                is_playing = pb.get('is_playing', False)
+                progress   = pb.get('progress_ms', 0)
                 with spotify_state_lock:
                     last = spotify_state['last_track_id']
                 if tid != last:
                     log.info(f"Spotify: {item['artists'][0]['name']} – {item['name']}")
                     img = download_art(item['album']['images'][0]['url'])
                     with spotify_state_lock:
-                        spotify_state['last_track_id']   = tid
-                        spotify_state['album_art_bytes'] = img
-                        spotify_state['palette']         = extract_palette(img)
+                        spotify_state['last_track_id']    = tid
+                        spotify_state['album_art_bytes']  = img
+                        spotify_state['palette']          = extract_palette(img)
                         spotify_state.update(new_plasma_params())
                         spotify_state['track_title']      = item['name']
                         spotify_state['track_artist']     = item['artists'][0]['name']
                         spotify_state['track_album']      = item['album']['name']
                         spotify_state['track_dur_ms']     = item['duration_ms']
-                        spotify_state['track_pos_ms']     = pb.get('progress_ms', 0)
-                        spotify_state['_pos_fetched_at']  = time.time()
+                        spotify_state['track_pos_ms']     = progress
+                        spotify_state['_pos_fetched_at']  = time.time() if is_playing else 0
+                        spotify_state['_is_playing']      = is_playing
                     poll_interval = 1
                 else:
+                    # update position and play state on every poll
                     with spotify_state_lock:
-                        spotify_state['track_pos_ms']    = pb.get('progress_ms', 0)
-                        spotify_state['_pos_fetched_at'] = time.time()
+                        spotify_state['track_pos_ms']    = progress
+                        spotify_state['_pos_fetched_at'] = time.time() if is_playing else 0
+                        spotify_state['_is_playing']     = is_playing
                     poll_interval = 2
         except Exception as e:
             log.warning(f"Spotify poll error: {e}")
@@ -839,17 +849,18 @@ def _write_shm():
     shm[OFF_TRACK_ARTIST : OFF_TRACK_ARTIST + 64] = artist_bytes
     shm[OFF_TRACK_ALBUM_S: OFF_TRACK_ALBUM_S + 64] = album_bytes
     shm_u32(OFF_TRACK_DUR_MS, ds.get('track_dur_ms', 0))
-    # interpolate position between Spotify polls
+    # interpolate position between polls only when playing; freeze when paused
     base_pos   = ds.get('track_pos_ms', 0)
     fetched_at = ds.get('_pos_fetched_at', 0)
-    if fetched_at > 0:
+    is_playing = ds.get('_is_playing', False)
+    if is_playing and fetched_at > 0:
         elapsed_since = time.time() - fetched_at
         estimated_pos = int(base_pos + elapsed_since * 1000)
         dur = ds.get('track_dur_ms', 0)
         if dur > 0 and estimated_pos > dur:
             estimated_pos = dur
     else:
-        estimated_pos = base_pos
+        estimated_pos = base_pos   # paused — lock to last known position
     shm_u32(OFF_TRACK_POS_MS, estimated_pos)
     shm_u32(OFF_DISPLAY_MODE, ui.get('display_mode', 0))
 
@@ -865,8 +876,13 @@ def shm_loop():
 # FLASK — /status (read-only) + /learn (triggers learning mode)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+from flask import Flask, jsonify, abort, request, render_template
+
 app = Flask(__name__)
 
+@app.route('/')
+def index():
+    return render_template('index.html')
 
 @app.route('/status')
 def route_status():

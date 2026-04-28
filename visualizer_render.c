@@ -416,8 +416,6 @@ static void render_plasma_chunk(const RenderParams *p, uint32_t *buf,
         float rot_y=yy*sin_td;
         uint32_t *row=buf+y*DISPLAY_W;
 
-        /* two-pass per row: find min/max then normalize */
-        float rmin=999.0f, rmax=-999.0f;
         for (int x=0;x<DISPLAY_W;x++) {
             float xx=x*inv_w;
             float w1=lut_sin((int)(xx*a*SIN_LUT_SIZE/(2*M_PI))+(int)(cos_tb*2*SIN_LUT_SIZE/(2*M_PI)));
@@ -425,20 +423,12 @@ static void render_plasma_chunk(const RenderParams *p, uint32_t *buf,
             float w3=lut_sin((int)(dist*SIN_LUT_SIZE/(2*M_PI))-(int)(t*c*SIN_LUT_SIZE/(2*M_PI)))*0.2f;
             float w4=lut_sin((int)((xx*cos_td+rot_y)*SIN_LUT_SIZE/(2*M_PI)));
             float v=w1+wave2+w3+w4;
-            if (v<rmin) rmin=v;
-            if (v>rmax) rmax=v;
-        }
-        float rrange=rmax-rmin; if (rrange<1e-6f) rrange=1e-6f;
-
-        for (int x=0;x<DISPLAY_W;x++) {
-            float xx=x*inv_w;
-            float w1=lut_sin((int)(xx*a*SIN_LUT_SIZE/(2*M_PI))+(int)(cos_tb*2*SIN_LUT_SIZE/(2*M_PI)));
-            float dist=lut_dist(x-cx_px,y-cy_px);
-            float w3=lut_sin((int)(dist*SIN_LUT_SIZE/(2*M_PI))-(int)(t*c*SIN_LUT_SIZE/(2*M_PI)))*0.2f;
-            float w4=lut_sin((int)((xx*cos_td+rot_y)*SIN_LUT_SIZE/(2*M_PI)));
-            float v=w1+wave2+w3+w4;
-            float norm=((v-rmin)/rrange);
-            float scaled=norm*cum[NUM_COLORS];
+            float norm = (v + 3.0f) / 6.0f;
+            if (norm < 0.0f) norm = 0.0f;
+            if (norm > 1.0f) norm = 1.0f;
+            /* plasma mode: darken midtones via fast quadratic (no powf) */
+            if (dim > 0.9f) norm = norm * (2.0f - norm) * 0.6f;
+            float scaled = norm * cum[NUM_COLORS];
             int ci=0;
             for (int pi=0;pi<NUM_COLORS-1;pi++) if (scaled>cum[pi+1]) ci=pi+1;
             ci = ci<NUM_COLORS-1 ? ci : NUM_COLORS-2;
@@ -503,9 +493,11 @@ static void render_stalagmites_chunk(const RenderParams *p, uint32_t *buf,
 
 static void overlay_album_art_centered(const RenderParams *p, uint32_t *buf) {
     if (!p->album_ready) return;
-    int sz=(int)p->album_size;
-    if (sz<10||sz>MAX_ALBUM_SIZE) return;
-    int x0=(DISPLAY_W-sz)/2, y0=(DISPLAY_H-sz)/2;
+    int src_sz=(int)p->album_size;
+    if (src_sz<10||src_sz>MAX_ALBUM_SIZE) return;
+    /* cap to 160px so it stays above freq bars */
+    int sz = src_sz > 160 ? 160 : src_sz;
+    int x0=(DISPLAY_W-sz)/2, y0=(DISPLAY_H/2 - sz/2 - 40);
     int r2=(sz/2)*(sz/2), cx2=sz/2, cy2=sz/2;
     for (int ay=0;ay<sz;ay++) {
         int gy=y0+ay; if (gy<0||gy>=DISPLAY_H) continue;
@@ -513,7 +505,8 @@ static void overlay_album_art_centered(const RenderParams *p, uint32_t *buf) {
             int gx=x0+ax; if (gx<0||gx>=DISPLAY_W) continue;
             int dx=ax-cx2, dy=ay-cy2;
             if (dx*dx+dy*dy>r2) continue;
-            int src=(ay*sz+ax)*3;
+            int ssx=(ax*src_sz)/sz, ssy=(ay*src_sz)/sz;
+            int src=(ssy*src_sz+ssx)*3;
             buf[gy*DISPLAY_W+gx]=rgb(p->album_data[src],
                                      p->album_data[src+1],
                                      p->album_data[src+2]);
@@ -640,64 +633,743 @@ static void draw_freq_bars(const RenderParams *p, uint32_t *buf) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
-   Info mode overlay (track info, progress bar, wave bars)
+   Scanline / CRT overlay — subtle horizontal lines for retro-future feel
+   ════════════════════════════════════════════════════════════════════════════ */
+
+static void draw_scanlines(uint32_t *buf) {
+    for (int y = 1; y < DISPLAY_H; y += 3) {
+        for (int x = 0; x < DISPLAY_W; x++) {
+            uint32_t p2 = buf[y * DISPLAY_W + x];
+            uint8_t r2 = ((p2 >> 16) & 0xFF) * 0.75f;
+            uint8_t g2 = ((p2 >>  8) & 0xFF) * 0.75f;
+            uint8_t b2 = ((p2      ) & 0xFF) * 0.75f;
+            buf[y * DISPLAY_W + x] = rgb(r2, g2, b2);
+        }
+    }
+}
+
+/* Draw a single horizontal rule with glow */
+static void draw_rule(uint32_t *buf, int y, uint8_t r, uint8_t g, uint8_t b) {
+    for (int x = 0; x < DISPLAY_W; x++) {
+        buf[y * DISPLAY_W + x] = rgb(r, g, b);
+        if (y > 0)
+            buf[(y-1) * DISPLAY_W + x] = rgb(r/3, g/3, b/3);
+        if (y < DISPLAY_H-1)
+            buf[(y+1) * DISPLAY_W + x] = rgb(r/4, g/4, b/4);
+    }
+}
+
+/* Draw a vertical rule */
+static void draw_vrule(uint32_t *buf, int x, int y0, int y1,
+                       uint8_t r, uint8_t g, uint8_t b) {
+    for (int y = y0; y < y1; y++) {
+        if (y < 0 || y >= DISPLAY_H) continue;
+        buf[y * DISPLAY_W + x] = rgb(r, g, b);
+        if (x > 0)            buf[y * DISPLAY_W + x-1] = rgb(r/4, g/4, b/4);
+        if (x < DISPLAY_W-1)  buf[y * DISPLAY_W + x+1] = rgb(r/4, g/4, b/4);
+    }
+}
+
+/* Corner brackets [  ] around the album art */
+static void draw_corner_brackets(uint32_t *buf, int x0, int y0, int x1, int y1,
+                                  int len, uint8_t r, uint8_t g, uint8_t b) {
+    /* top-left */
+    for (int i=0;i<len;i++) {
+        if (y0+0 < DISPLAY_H && x0+i < DISPLAY_W) buf[(y0)*DISPLAY_W + x0+i] = rgb(r,g,b);
+        if (y0+1 < DISPLAY_H && x0+i < DISPLAY_W) buf[(y0+1)*DISPLAY_W + x0+i] = rgb(r/2,g/2,b/2);
+        if (x0+0 < DISPLAY_W && y0+i < DISPLAY_H) buf[(y0+i)*DISPLAY_W + x0] = rgb(r,g,b);
+        if (x0+1 < DISPLAY_W && y0+i < DISPLAY_H) buf[(y0+i)*DISPLAY_W + x0+1] = rgb(r/2,g/2,b/2);
+    }
+    /* top-right */
+    for (int i=0;i<len;i++) {
+        if (y0+0 < DISPLAY_H && x1-i >= 0) buf[(y0)*DISPLAY_W + x1-i] = rgb(r,g,b);
+        if (y0+1 < DISPLAY_H && x1-i >= 0) buf[(y0+1)*DISPLAY_W + x1-i] = rgb(r/2,g/2,b/2);
+        if (x1-0 >= 0 && x1 < DISPLAY_W && y0+i < DISPLAY_H) buf[(y0+i)*DISPLAY_W + x1] = rgb(r,g,b);
+        if (x1-1 >= 0 && y0+i < DISPLAY_H) buf[(y0+i)*DISPLAY_W + x1-1] = rgb(r/2,g/2,b/2);
+    }
+    /* bottom-left */
+    for (int i=0;i<len;i++) {
+        if (y1 < DISPLAY_H && x0+i < DISPLAY_W) buf[(y1)*DISPLAY_W + x0+i] = rgb(r,g,b);
+        if (y1-1 >= 0 && x0+i < DISPLAY_W) buf[(y1-1)*DISPLAY_W + x0+i] = rgb(r/2,g/2,b/2);
+        if (x0 < DISPLAY_W && y1-i >= 0 && y1-i < DISPLAY_H) buf[(y1-i)*DISPLAY_W + x0] = rgb(r,g,b);
+        if (x0+1 < DISPLAY_W && y1-i >= 0 && y1-i < DISPLAY_H) buf[(y1-i)*DISPLAY_W + x0+1] = rgb(r/2,g/2,b/2);
+    }
+    /* bottom-right */
+    for (int i=0;i<len;i++) {
+        if (y1 < DISPLAY_H && x1-i >= 0) buf[(y1)*DISPLAY_W + x1-i] = rgb(r,g,b);
+        if (y1-1 >= 0 && x1-i >= 0) buf[(y1-1)*DISPLAY_W + x1-i] = rgb(r/2,g/2,b/2);
+        if (x1 < DISPLAY_W && y1-i >= 0) buf[(y1-i)*DISPLAY_W + x1] = rgb(r,g,b);
+        if (x1-1 >= 0 && y1-i >= 0) buf[(y1-i)*DISPLAY_W + x1-1] = rgb(r/2,g/2,b/2);
+    }
+}
+/*
+ * ════════════════════════════════════════════════════════════════════════════
+ * GLITCH CA — v3  (drop-in replacement for the CA block in visualizer_render.c)
+ *
+ * Architecture
+ * ────────────
+ *  Each visible entity is a PAIR: one solid + one ghost halo.
+ *  g_pairs[i].solid  = solid core
+ *  g_pairs[i].ghost  = ghost halo, spatially coupled to its solid parent
+ *
+ *  The ghost spawns at the SAME seed_col/seed_row as its solid, GHOST_LAG
+ *  ticks later, with target_cells = solid.target + small random extra so it
+ *  always extends slightly past the solid boundary.  Its frontier picker
+ *  uses the parent solid's live[] as a proximity attractor — candidates
+ *  that neighbour a solid cell are heavily favoured, so the ghost always
+ *  reads as the solid's ragged fringe rather than a separate random blob.
+ *
+ *  SOLID frontier — center-weighted: inner cells get high oval_weight,
+ *                   boundary cells get low weight + small random jitter.
+ *                   Fills inward-first → smooth oval body, natural taper.
+ *
+ *  GHOST frontier — perimeter-hugging: tip-only (no gap-fill), strongly
+ *                   biased toward cells adjacent to the solid boundary.
+ *                   Allowed into fringe rows for the stringy drip effect.
+ *
+ *  Ghost presence  — border ~18%, inner ~38%, fill ~55% colour over bg.
+ *                    Clearly visible but subordinate to the solid above.
+ *
+ *  Lifecycle
+ *    solid spawns  → ghost_lag = GHOST_LAG; ghost stays DEAD until lag=0
+ *    solid DYING   → ghost pushed to DYING on same tick
+ *    solid DEAD    → ghost orphaned, finishes dying on its own schedule
+ *
+ *  Playhead anti-corruption
+ *    Cells within KILL_RADIUS px of head_x die every tick.
+ *    Spawn rejected if seed col is within SPAWN_DEAD_ZONE of head_col.
+ *    Spawn is uniform across the full bar length.
+ *
+ *  RPi 3B optimisations
+ *    · All CA hot paths integer-only (no per-cell float ops in tick)
+ *    · Frontier/edge candidate arrays fixed-size on the stack, bounded
+ *    · Single xorshift32 RNG — 3 XOR shifts, one register
+ *    · 2 pairs × 2 seeds × 384 bytes live[] = ~1.5 kB total state
+ * ════════════════════════════════════════════════════════════════════════════
+ */
+
+/* ── grid constants ── */
+#define CELL_W        6
+#define CELL_H        6
+#define BAR_FRINGE    10
+#define STRIP_TOP     (INFO_PROG_Y - BAR_FRINGE)
+#define STRIP_H       (INFO_PROG_H + BAR_FRINGE * 2)
+#define GCOLS         (INFO_PROG_W / CELL_W)      /* 580/6 = 96  */
+#define GROWS         (STRIP_H    / CELL_H)       /* 26/6  = 4   */
+#define GCELLS        (GCOLS * GROWS)             /* 384         */
+
+#define BAR_ROW_MIN   (BAR_FRINGE / CELL_H)                 /* 1 */
+#define BAR_ROW_MAX   ((BAR_FRINGE + INFO_PROG_H) / CELL_H) /* 2 */
+
+/* ── tuning ── */
+#define MAX_PAIRS        2    /* number of solid+ghost pairs live at once */
+#define MIN_LIVE_SOLID   55
+#define MAX_LIVE_SOLID   85
+#define GHOST_EXTRA      14
+#define GHOST_LAG        18   /* ticks after solid spawn before ghost spawns */
+#define KILL_RADIUS      6    /* px from head_x → cells die each tick */
+#define SPAWN_DEAD_ZONE  2    /* cell columns either side of head_col → no spawn */
+#define DRIP_RADIUS      8
+#define DRIP_WEIGHT      12
+
+/* ── state machine ── */
+typedef enum { SEED_DEAD=0, SEED_GROWING, SEED_ALIVE, SEED_DYING } SeedState;
+
+typedef struct {
+    SeedState state;
+    uint8_t   live[GCELLS];
+    int       live_count;
+    int       target_cells;
+    int       hold_ticks;
+    int       age_ticks;
+    int       die_phase;
+    int       seed_col;
+    int       seed_row;
+    uint8_t   cr, cg, cb;
+} GlitchSeed;
+
+typedef struct {
+    GlitchSeed solid;
+    GlitchSeed ghost;
+    int        ghost_lag;
+    int        drip_col;
+    int        drip_dir;   /* -1=left, +1=right, horizontal spread bias */
+} GlitchPair;
+
+static GlitchPair g_pairs[MAX_PAIRS];
+static float      g_cooldown = 0.0f;
+
+/* ── xorshift32 ── */
+static uint32_t g_rng = 0xDEAD1973u;
+static inline uint32_t grng(void) {
+    g_rng ^= g_rng << 13;
+    g_rng ^= g_rng >> 17;
+    g_rng ^= g_rng << 5;
+    return g_rng;
+}
+
+/* ── cell helpers ── */
+static inline int gcell(int col, int row) { return row * GCOLS + col; }
+static inline int gcol(int idx)           { return idx % GCOLS; }
+static inline int grow_r(int idx)         { return idx / GCOLS; }
+static inline int g_is_fringe(int row)    { return (row < BAR_ROW_MIN || row > BAR_ROW_MAX); }
+
+static inline int g_neighbours(const GlitchSeed *s, int col, int row) {
+    int n = 0;
+    if (col > 0       && s->live[gcell(col-1, row)]) n++;
+    if (col < GCOLS-1 && s->live[gcell(col+1, row)]) n++;
+    if (row > 0       && s->live[gcell(col, row-1)]) n++;
+    if (row < GROWS-1 && s->live[gcell(col, row+1)]) n++;
+    return n;
+}
+
+static inline int g_nb(const GlitchSeed *s, int nc, int nr) {
+    if (nc < 0 || nc >= GCOLS || nr < 0 || nr >= GROWS) return 0;
+    return s->live[gcell(nc, nr)];
+}
+
+/* ── oval distance weight ──────────────────────────────────────────────────
+ *  Stretched ellipse centred on (seed_col, seed_row).
+ *  Returns 1-8 graded centre→edge; 0 outside the ellipse.
+ *  High weight near centre → frontier fills inward first → smooth oval body.
+ */
+static inline int g_oval_weight(const GlitchSeed *s, int col, int row) {
+    int dc  = col - s->seed_col;
+    int dr  = row - s->seed_row;
+    int rv2 = 1 + s->target_cells / 12;
+    int rh2 = (s->target_cells * s->target_cells * 30) / 100;
+    int lhs = dc*dc * rv2 + dr*dr * rh2;
+    int rhs = rh2 * rv2;
+    if (lhs > rhs * 9 / 4) return 0;
+    int dist8 = (lhs * 8) / (rhs + 1);
+    return 8 - dist8;
+}
+/* ── solid frontier picker ─────────────────────────────────────────────────
+ *  Dominant term is oval_weight (high near centre → fills inward first).
+ *  tip_w allows some gap-fill (nb==2) for a smooth body, but at low weight.
+ *  Noise jitter applied only at the outer ring (oval_weight <= 2) so the
+ *  interior is deterministically smooth and only the edge looks organic.
+ */
+#define FRONTIER_MAX 96
+static int g_solid_frontier(const GlitchSeed *s) {
+    int cands[FRONTIER_MAX];
+    int weights[FRONTIER_MAX];
+    int nc = 0;
+
+    for (int idx = 0; idx < GCELLS && nc < FRONTIER_MAX; idx++) {
+        if (s->live[idx]) continue;
+        int c = gcol(idx), r = grow_r(idx);
+        if (g_neighbours(s, c, r) == 0) continue;
+
+        int ow = g_oval_weight(s, c, r);
+        if (ow == 0) continue;
+
+        /* solid never enters fringe rows */
+        if (g_is_fringe(r)) continue;
+
+        int nb = g_neighbours(s, c, r);
+        /* gap-fill allowed (nb>=2) to ensure dense uniform body */
+        int tip_w = (nb == 1) ? 3 : (nb == 2) ? 2 : (nb >= 3) ? 1 : 0;
+        if (tip_w == 0) continue;
+
+        int w = ow * tip_w;
+        /* no jitter on interior — keeps body smooth and dense */
+        if (w < 1) w = 1;
+
+        cands[nc]   = idx;
+        weights[nc] = w;
+        nc++;
+    }
+    if (nc == 0) return -1;
+
+    int total = 0;
+    for (int i = 0; i < nc; i++) total += weights[i];
+    int pick = (int)(grng() % (uint32_t)total);
+    int running = 0;
+    for (int i = 0; i < nc; i++) {
+        running += weights[i];
+        if (pick < running) return cands[i];
+    }
+    return cands[nc-1];
+}
+
+/* ── ghost frontier picker ─────────────────────────────────────────────────
+ *  Perimeter-hugging: candidates adjacent to a solid live cell get a large
+ *  proximity bonus so the ghost naturally wraps the solid boundary.
+ *  tip_w is tip-only (no gap-fill) to keep the ghost stringy.
+ *  No fringe penalty — allowed to drip into the fringe rows.
+ *
+ *  solid_live: parent solid's live[] array (NULL if solid already dead).
+ */
+static int g_ghost_frontier(const GlitchSeed *s, const uint8_t *solid_live,
+                             int drip_col, int drip_dir, int at_target) {
+    int cands[FRONTIER_MAX];
+    int weights[FRONTIER_MAX];
+    int nc = 0;
+
+    for (int idx = 0; idx < GCELLS && nc < FRONTIER_MAX; idx++) {
+        if (s->live[idx]) continue;
+        int c = gcol(idx), r = grow_r(idx);
+        if (g_neighbours(s, c, r) == 0) continue;
+
+        /* clump growth — tips and gap-fill both allowed for natural clusters */
+        int nb = g_neighbours(s, c, r);
+        int tip_w = (nb == 1) ? 5 : (nb == 2) ? 3 : (nb >= 3) ? 1 : 0;
+        if (tip_w == 0) continue;
+
+        /* proximity to solid boundary: each adjacent solid cell adds weight */
+        int prox = 0;
+        if (solid_live) {
+            if (c > 0       && solid_live[gcell(c-1, r)]) prox++;
+            if (c < GCOLS-1 && solid_live[gcell(c+1, r)]) prox++;
+            if (r > 0       && solid_live[gcell(c, r-1)]) prox++;
+            if (r < GROWS-1 && solid_live[gcell(c, r+1)]) prox++;
+        }
+        /* prox 0 = away from solid (neutral), prox 1-4 = hugging edge */
+        int prox_w = prox ? (prox * 4) : 1;
+
+        int drip_w = 1;
+        if (g_is_fringe(r)) {
+            int dd = c - drip_col;
+            if (dd < 0) dd = -dd;
+            if (dd <= DRIP_RADIUS)
+                drip_w = DRIP_WEIGHT - dd;
+        }
+        /* once at target size, strongly bias horizontal spread in drip_dir */
+        int horiz_w = 1;
+        if (at_target && !g_is_fringe(r)) {
+            int dc = (drip_dir > 0) ? (c - drip_col) : (drip_col - c);
+            if (dc >= 0 && dc < 20)
+                horiz_w = 6 - dc / 4;
+            if (horiz_w < 1) horiz_w = 1;
+        }
+        int w = tip_w * prox_w * drip_w * horiz_w;
+        w += (int)(grng() % 3) - 1;
+        if (w < 1) w = 1;
+
+        cands[nc]   = idx;
+        weights[nc] = w;
+        nc++;
+    }
+    if (nc == 0) return -1;
+
+    int total = 0;
+    for (int i = 0; i < nc; i++) total += weights[i];
+    int pick = (int)(grng() % (uint32_t)total);
+    int running = 0;
+    for (int i = 0; i < nc; i++) {
+        running += weights[i];
+        if (pick < running) return cands[i];
+    }
+    return cands[nc-1];
+}
+
+/* ── edge picker (shared) ── */
+#define EDGE_MAX 128
+static int g_random_edge(const GlitchSeed *s) {
+    int cands[EDGE_MAX]; int nc = 0;
+
+    for (int idx = 0; idx < GCELLS; idx++) {
+        if (!s->live[idx]) continue;
+        int c = gcol(idx), r = grow_r(idx);
+        int nb = g_neighbours(s, c, r);
+        if (nb >= 3) continue;
+
+        int base_w = (nb == 0) ? 12 : (nb == 1) ? 4 : 1;
+        int weight  = g_is_fringe(r) ? base_w * 3 : base_w;
+        for (int w = 0; w < weight && nc < EDGE_MAX - 1; w++)
+            cands[nc++] = idx;
+    }
+    if (nc == 0) {
+        for (int idx = 0; idx < GCELLS && nc < EDGE_MAX; idx++)
+            if (s->live[idx]) cands[nc++] = idx;
+    }
+    if (nc == 0) return -1;
+    return cands[grng() % (uint32_t)nc];
+}
+
+/* ── kill cells near playhead ── */
+static void g_kill_near_head(GlitchSeed *s, int head_col) {
+    for (int idx = 0; idx < GCELLS; idx++) {
+        if (!s->live[idx]) continue;
+        int d = gcol(idx) - head_col;
+        if (d < 0) d = -d;
+        if (d * CELL_W <= KILL_RADIUS) {
+            s->live[idx] = 0;
+            s->live_count--;
+        }
+    }
+    if (s->live_count < 0) s->live_count = 0;
+}
+
+/* ── spawn solid (also arms the ghost lag counter) ── */
+static void g_spawn_solid(GlitchPair *pair, int head_col,
+                           const uint8_t palette[][3]) {
+    GlitchSeed *s = &pair->solid;
+    memset(s->live, 0, GCELLS);
+    s->live_count   = 1;
+    s->target_cells = MIN_LIVE_SOLID +
+                      (int)(grng() % (MAX_LIVE_SOLID - MIN_LIVE_SOLID + 1));
+    s->hold_ticks   = 90 + (int)(grng() % 121);
+    s->age_ticks    = 0;
+    s->die_phase    = 0;
+    s->state        = SEED_GROWING;
+
+    int core = BAR_ROW_MAX - BAR_ROW_MIN + 1;
+    if (core < 1) core = 1;
+    s->seed_row = BAR_ROW_MIN + (int)(grng() % core);
+
+    int attempts = 0;
+    do {
+        s->seed_col = 1 + (int)(grng() % (GCOLS - 2));
+        int d = s->seed_col - head_col;
+        if (d < 0) d = -d;
+        if (d > SPAWN_DEAD_ZONE) break;
+    } while (++attempts < 32);
+
+    s->live[gcell(s->seed_col, s->seed_row)] = 1;
+
+    int pi = (int)(grng() % NUM_COLORS);
+    s->cr = palette[pi][0];
+    s->cg = palette[pi][1];
+    s->cb = palette[pi][2];
+    int total = (int)s->cr + s->cg + s->cb;
+    if (total < 180) {
+        int boost = (180 - total) / 3;
+        s->cr = (uint8_t)(s->cr + boost > 255 ? 255 : s->cr + boost);
+        s->cg = (uint8_t)(s->cg + boost > 255 ? 255 : s->cg + boost);
+        s->cb = (uint8_t)(s->cb + boost > 255 ? 255 : s->cb + boost);
+    }
+
+    pair->ghost_lag   = GHOST_LAG;
+    pair->ghost.state = SEED_DEAD;
+    int drip_offset = (int)(grng() % 20) - 10;
+    pair->drip_col = s->seed_col + drip_offset;
+    if (pair->drip_col < 1) pair->drip_col = 1;
+    if (pair->drip_col > GCOLS-2) pair->drip_col = GCOLS-2;
+    pair->drip_dir = (grng() & 1) ? 1 : -1;
+}
+
+/* ── spawn ghost (called internally by g_tick when lag expires) ── */
+static void g_spawn_ghost(GlitchPair *pair) {
+    const GlitchSeed *solid = &pair->solid;
+    GlitchSeed       *g     = &pair->ghost;
+    memset(g->live, 0, GCELLS);
+    g->live_count   = 1;
+    g->target_cells = solid->target_cells + (int)(grng() % (GHOST_EXTRA + 1));
+    g->hold_ticks   = solid->hold_ticks;
+    g->age_ticks    = 0;
+    g->die_phase    = 0;
+    g->state        = SEED_GROWING;
+    g->seed_col     = solid->seed_col;
+    g->seed_row     = solid->seed_row;
+    g->live[gcell(g->seed_col, g->seed_row)] = 1;
+    g->cr = solid->cr;
+    g->cg = solid->cg;
+    g->cb = solid->cb;
+}
+
+/* ── tick one seed ── */
+static void g_tick_seed(GlitchSeed *s, int head_col,
+                         int ghost, const uint8_t *solid_live,
+                         int drip_col, int drip_dir) {
+    if (s->state == SEED_DEAD) return;
+    s->age_ticks++;
+
+    g_kill_near_head(s, head_col);
+    if (s->live_count <= 0) { s->state = SEED_DEAD; return; }
+
+    if (s->state == SEED_GROWING) {
+        if (s->live_count >= s->target_cells) {
+            s->state = SEED_ALIVE; s->age_ticks = 0;
+        } else {
+            int period = ghost ? 3 : 5;
+            if ((s->age_ticks % period) == 0) {
+                int f = ghost ? g_ghost_frontier(s, solid_live, drip_col, drip_dir,
+                                    s->state == SEED_ALIVE)
+                              : g_solid_frontier(s);
+                if (f < 0) { s->state = SEED_ALIVE; s->age_ticks = 0; }
+                else       { s->live[f] = 1; s->live_count++; }
+            }
+        }
+    }
+    else if (s->state == SEED_ALIVE) {
+        int period = ghost ? 5 : 12;
+        if (s->age_ticks % period == 0) {
+            int edge = g_random_edge(s);
+            if (edge >= 0) {
+                s->live[edge] = 0; s->live_count--;
+                int f = ghost ? g_ghost_frontier(s, solid_live, drip_col, drip_dir,
+                                    s->state == SEED_ALIVE)
+                              : g_solid_frontier(s);
+                if (f >= 0) { s->live[f] = 1; s->live_count++; }
+            }
+        }
+        if (s->age_ticks >= s->hold_ticks) {
+            s->state = SEED_DYING; s->age_ticks = 0; s->die_phase = 0;
+        }
+    }
+    else if (s->state == SEED_DYING) {
+        int period = ghost ? 2 : 3;
+        s->die_phase = (s->die_phase + 1) % period;
+        if (s->die_phase == 0) {
+            int edge = g_random_edge(s);
+            if (edge >= 0) { s->live[edge] = 0; s->live_count--; }
+        }
+        if (s->live_count <= 0) s->state = SEED_DEAD;
+    }
+}
+
+/* ── master tick ── */
+static void g_tick(float prog, const uint8_t palette[][3]) {
+    int head_col = (int)(prog * GCOLS);
+
+    if (g_cooldown > 0.0f) g_cooldown -= 1.0f;
+
+    if (g_cooldown <= 0.0f && prog > 0.02f && (grng() & 0xFF) < 4) {
+        for (int i = 0; i < MAX_PAIRS; i++) {
+            if (g_pairs[i].solid.state == SEED_DEAD &&
+                g_pairs[i].ghost.state == SEED_DEAD) {
+                g_spawn_solid(&g_pairs[i], head_col, palette);
+                g_cooldown = 250.0f + (float)(grng() % 201);
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < MAX_PAIRS; i++) {
+        GlitchPair *p = &g_pairs[i];
+
+        /* count down lag; only while solid is still alive */
+        if (p->solid.state == SEED_GROWING || p->solid.state == SEED_ALIVE) {
+            if (p->ghost.state == SEED_DEAD) {
+                if (p->ghost_lag > 0) {
+                    p->ghost_lag--;
+                } else {
+                    g_spawn_ghost(p);
+                }
+            }
+        }
+
+        g_tick_seed(&p->solid, head_col, 0, NULL, p->drip_col, p->drip_dir);
+
+        const uint8_t *sl = (p->solid.state != SEED_DEAD)
+                            ? p->solid.live : NULL;
+        g_tick_seed(&p->ghost, head_col, 1, sl, p->drip_col, p->drip_dir);
+
+        /* sync AFTER both tick so state is final for this frame */
+        if (p->solid.state == SEED_DEAD || p->solid.state == SEED_DYING) {
+            if (p->ghost.state == SEED_GROWING || p->ghost.state == SEED_ALIVE) {
+                p->ghost.state     = SEED_DYING;
+                p->ghost.age_ticks = 0;
+                p->ghost.die_phase = 0;
+            }
+        }
+    }
+}
+
+/* ── render one seed ── */
+static void g_render_seed(const GlitchSeed *s, uint32_t *buf, int ghost) {
+    if (s->state == SEED_DEAD) return;
+
+    for (int idx = 0; idx < GCELLS; idx++) {
+        if (!s->live[idx]) continue;
+
+        int col = gcol(idx);
+        int row = grow_r(idx);
+        int px  = INFO_PROG_X + col * CELL_W;
+        int py  = STRIP_TOP   + row * CELL_H;
+
+        int face_left  = !g_nb(s, col-1, row);
+        int face_right = !g_nb(s, col+1, row);
+        int face_up    = !g_nb(s, col,   row-1);
+        int face_down  = !g_nb(s, col,   row+1);
+
+        /* solid only: bleed one pixel above/below the strip for a natural edge */
+        if (!ghost && face_up) {
+            int bpy = py - 1;
+            if (bpy >= 0 && bpy < DISPLAY_H) {
+                for (int dx = 1; dx < CELL_W-1; dx++) {
+                    int fx = px + dx;
+                    if ((unsigned)fx < (unsigned)DISPLAY_W)
+                        buf[bpy * DISPLAY_W + fx] = rgb(
+                            (uint8_t)(s->cr * 0.4f),
+                            (uint8_t)(s->cg * 0.4f),
+                            (uint8_t)(s->cb * 0.4f));
+                }
+            }
+        }
+        if (!ghost && face_down) {
+            int bpy = py + CELL_H;
+            if (bpy >= 0 && bpy < DISPLAY_H) {
+                for (int dx = 1; dx < CELL_W-1; dx++) {
+                    int fx = px + dx;
+                    if ((unsigned)fx < (unsigned)DISPLAY_W)
+                        buf[bpy * DISPLAY_W + fx] = rgb(
+                            (uint8_t)(s->cr * 0.4f),
+                            (uint8_t)(s->cg * 0.4f),
+                            (uint8_t)(s->cb * 0.4f));
+                }
+            }
+        }
+
+        for (int dy = 0; dy < CELL_H; dy++) {
+            int fy = py + dy;
+            if ((unsigned)fy >= (unsigned)DISPLAY_H) continue;
+            for (int dx = 0; dx < CELL_W; dx++) {
+                int fx = px + dx;
+                if ((unsigned)fx >= (unsigned)DISPLAY_W) continue;
+
+                int is_border = (
+                    (dx == 0          && face_left)  ||
+                    (dx == CELL_W - 1 && face_right) ||
+                    (dy == 0          && face_up)    ||
+                    (dy == CELL_H - 1 && face_down)
+                );
+                int is_inner = !is_border && (
+                    (dx == 1          && face_left)  ||
+                    (dx == CELL_W - 2 && face_right) ||
+                    (dy == 1          && face_up)    ||
+                    (dy == CELL_H - 2 && face_down)
+                );
+
+                uint32_t dst = buf[fy * DISPLAY_W + fx];
+                uint8_t  dr  = (dst >> 16) & 0xFF;
+                uint8_t  dg  = (dst >>  8) & 0xFF;
+                uint8_t  db  =  dst         & 0xFF;
+                uint8_t  out_r, out_g, out_b;
+
+                if (ghost) {
+                    /*
+                     * Ghost: clearly present but subordinate to solid.
+                     * Border ~18% — faint cell outline.
+                     * Inner  ~38% — readable tint.
+                     * Fill   ~55% — noticeable, still translucent.
+                     */
+                    if (is_border) {
+                        out_r = (uint8_t)(s->cr * 0.18f + dr * 0.72f);
+                        out_g = (uint8_t)(s->cg * 0.18f + dg * 0.72f);
+                        out_b = (uint8_t)(s->cb * 0.18f + db * 0.72f);
+                    } else if (is_inner) {
+                        out_r = (uint8_t)(s->cr * 0.38f + dr * 0.62f);
+                        out_g = (uint8_t)(s->cg * 0.38f + dg * 0.62f);
+                        out_b = (uint8_t)(s->cb * 0.38f + db * 0.62f);
+                    } else {
+                        out_r = (uint8_t)(s->cr * 0.55f + dr * 0.45f);
+                        out_g = (uint8_t)(s->cg * 0.55f + dg * 0.45f);
+                        out_b = (uint8_t)(s->cb * 0.55f + db * 0.45f);
+                    }
+                } else {
+                    /*
+                     * Solid: EVA-panel — hard dark border, bright fill.
+                     */
+                    if (is_border) {
+                        out_r = s->cr >> 4;
+                        out_g = s->cg >> 4;
+                        out_b = s->cb >> 4;
+                    } else if (is_inner) {
+                        out_r = (uint8_t)(s->cr * 0.55f);
+                        out_g = (uint8_t)(s->cg * 0.55f);
+                        out_b = (uint8_t)(s->cb * 0.55f);
+                    } else {
+                        out_r = s->cr;
+                        out_g = s->cg;
+                        out_b = s->cb;
+                    }
+                }
+
+                buf[fy * DISPLAY_W + fx] = rgb(out_r, out_g, out_b);
+            }
+        }
+    }
+}
+
+/* ── master render: ghost layer first, solid on top ── */
+static void g_render(uint32_t *buf, int head_x) {
+    (void)head_x;
+    for (int i = 0; i < MAX_PAIRS; i++) g_render_seed(&g_pairs[i].ghost, buf, 1);
+    for (int i = 0; i < MAX_PAIRS; i++) g_render_seed(&g_pairs[i].solid, buf, 0);
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   draw_info_overlay
    ════════════════════════════════════════════════════════════════════════════ */
 
 static void draw_info_overlay(const RenderParams *p, uint32_t *buf) {
     char tmp[128];
 
-    /* ── title (3× scale, white, max 18 chars) ── */
+    uint8_t ar = p->palette[NUM_COLORS-1][0];
+    uint8_t ag = p->palette[NUM_COLORS-1][1];
+    uint8_t ab = p->palette[NUM_COLORS-1][2];
+    if ((int)ar - (int)ab > 60 || (ar < 60 && ag < 60 && ab < 60)) {
+        ar = 0; ag = 220; ab = 200;
+    }
+    uint8_t dr = ar/3, dg = ag/3, db = ab/3;
+
+    draw_vrule(buf, INFO_TEXT_X - 14,
+               INFO_ART_Y - 8, INFO_ART_Y + INFO_ART_SIZE + 8, ar, ag, ab);
+    draw_rule(buf, INFO_TITLE_Y - 10, dr, dg, db);
+    draw_rule(buf, INFO_ALBUM_Y + 20, dr, dg, db);
+    draw_corner_brackets(buf,
+        INFO_ART_X - 6,                  INFO_ART_Y - 6,
+        INFO_ART_X + INFO_ART_SIZE + 6,  INFO_ART_Y + INFO_ART_SIZE + 6,
+        20, ar, ag, ab);
+
+    draw_text(buf, INFO_TEXT_X, INFO_TITLE_Y - 22, "NOW PLAYING", 1, ar, ag, ab, 180);
+
     truncate_text(p->track_title, tmp, 18);
     draw_text(buf, INFO_TEXT_X, INFO_TITLE_Y, tmp, 3, 255, 255, 255, 255);
 
-    /* ── artist (2× scale, light gray) ── */
-    truncate_text(p->track_artist, tmp, 26);
-    draw_text(buf, INFO_TEXT_X, INFO_ARTIST_Y, tmp, 2, 200, 200, 200, 220);
+    truncate_text(p->track_artist, tmp, 28);
+    draw_text(buf, INFO_TEXT_X, INFO_ARTIST_Y, tmp, 2, ar, ag, ab, 230);
 
-    /* ── album (2× scale, dimmer) ── */
-    truncate_text(p->track_album, tmp, 26);
-    draw_text(buf, INFO_TEXT_X, INFO_ALBUM_Y, tmp, 2, 150, 150, 170, 200);
+    truncate_text(p->track_album, tmp, 40);
+    draw_text(buf, INFO_TEXT_X, INFO_ALBUM_Y + 4, tmp, 1, 140, 160, 160, 180);
 
-    /* ── progress bar background ── */
-    for (int y=INFO_PROG_Y; y<INFO_PROG_Y+INFO_PROG_H; y++)
-        for (int x=INFO_PROG_X; x<INFO_PROG_X+INFO_PROG_W; x++)
-            buf[y*DISPLAY_W+x] = rgb(50, 50, 60);
+    /* dark bar track */
+    for (int y2 = INFO_PROG_Y; y2 < INFO_PROG_Y + INFO_PROG_H; y2++)
+        for (int x2 = INFO_PROG_X; x2 < INFO_PROG_X + INFO_PROG_W; x2++)
+            buf[y2*DISPLAY_W+x2] = rgb(20, 30, 35);
 
-    /* ── progress fill ── */
+    /* progress fill — 30% accent tint leaving a color trace */
     float prog = 0.0f;
     if (p->track_dur_ms > 0)
         prog = (float)p->track_pos_ms / (float)p->track_dur_ms;
-    if (prog>1.0f) prog=1.0f; if (prog<0.0f) prog=0.0f;
+    if (prog > 1.0f) prog = 1.0f;
+    if (prog < 0.0f) prog = 0.0f;
     int fill_w = (int)(prog * INFO_PROG_W);
-    uint8_t pr=p->palette[NUM_COLORS-1][0];
-    uint8_t pg2=p->palette[NUM_COLORS-1][1];
-    uint8_t pb=p->palette[NUM_COLORS-1][2];
-    if (pr<80&&pg2<80&&pb<80) { pr=100; pg2=180; pb=255; }
-    for (int y=INFO_PROG_Y; y<INFO_PROG_Y+INFO_PROG_H; y++)
-        for (int x=INFO_PROG_X; x<INFO_PROG_X+fill_w; x++)
-            buf[y*DISPLAY_W+x] = rgb(pr, pg2, pb);
+    int head_x = INFO_PROG_X + fill_w;
 
-    /* ── progress dot ── */
-    int dot_x = INFO_PROG_X + fill_w;
-    for (int y=INFO_PROG_Y-2; y<INFO_PROG_Y+INFO_PROG_H+2; y++)
-        for (int x=dot_x-3; x<dot_x+3; x++)
-            if (x>=0&&x<DISPLAY_W&&y>=0&&y<DISPLAY_H)
-                buf[y*DISPLAY_W+x] = rgb(255,255,255);
+    for (int y2 = INFO_PROG_Y; y2 < INFO_PROG_Y + INFO_PROG_H; y2++) {
+        for (int x2 = INFO_PROG_X; x2 < INFO_PROG_X + fill_w; x2++) {
+            uint32_t dst = buf[y2*DISPLAY_W+x2];
+            buf[y2*DISPLAY_W+x2] = rgb(
+                (uint8_t)(ar * 0.30f + ((dst>>16)&0xFF) * 0.70f),
+                (uint8_t)(ag * 0.30f + ((dst>> 8)&0xFF) * 0.70f),
+                (uint8_t)(ab * 0.30f + ( dst     &0xFF) * 0.70f));
+        }
+    }
 
-    /* ── time elapsed / duration ── */
+    /* CA tick and render */
+    g_tick(prog, p->palette);
+    g_render(buf, head_x);
+
+    /* playhead line — always on top */
+    if (head_x > INFO_PROG_X && head_x < INFO_PROG_X + INFO_PROG_W) {
+        for (int y2 = INFO_PROG_Y - 2; y2 < INFO_PROG_Y + INFO_PROG_H + 2; y2++)
+            if (y2 >= 0 && y2 < DISPLAY_H)
+                buf[y2*DISPLAY_W+head_x] = rgb(255, 255, 255);
+    }
+
     char elapsed[8], total[8];
     format_time(p->track_pos_ms, elapsed);
     format_time(p->track_dur_ms, total);
-    draw_text(buf, INFO_PROG_X, INFO_TIME_Y, elapsed, 1, 180, 180, 180, 200);
-    /* right-align total time */
-    int total_len=0; while(total[total_len]) total_len++;
-    draw_text(buf, INFO_PROG_X+INFO_PROG_W-(total_len*9), INFO_TIME_Y,
-              total, 1, 180, 180, 180, 200);
+    draw_text(buf, INFO_PROG_X, INFO_TIME_Y, elapsed, 1, ar, ag, ab, 220);
+    int tlen = 0; while (total[tlen]) tlen++;
+    draw_text(buf, INFO_PROG_X + INFO_PROG_W - (tlen*9), INFO_TIME_Y,
+              total, 1, dr, dg+40, db+40, 180);
 
-    /* ── wave bars ── */
     draw_wave_bars(p, buf);
-
-    /* ── album art ── */
     overlay_album_art_info(p, buf);
 }
 
@@ -718,8 +1390,12 @@ static void *render_thread(void *arg) {
         pthread_barrier_wait(&frame_barrier);
         if (ta->thread_id == 0) {
             if (p->display_mode == 1) {
+                /* CRT over plasma background first, then UI elements clean on top */
+                draw_scanlines(ta->buf);
                 draw_info_overlay(p, ta->buf);
             } else {
+                /* CRT over plasma first, then freq bars + album art clean on top */
+                draw_scanlines(ta->buf);
                 if (p->show_bands) draw_freq_bars(p, ta->buf);
                 if (p->show_album) overlay_album_art_centered(p, ta->buf);
             }
