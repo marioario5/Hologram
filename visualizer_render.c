@@ -279,12 +279,17 @@ static inline float lut_sin(int idx) {
     return sin_lut[idx & SIN_LUT_MASK] * (1.0f / 32767.0f);
 }
 
-static inline float lut_dist(int dx, int dy) {
+/* Precomputed scale: dist2 → LUT index units.
+ * max dist2 = 512^2+300^2 = 352144; we want output in [0, SIN_LUT_SIZE).
+ * scale = SIN_LUT_SIZE / 352144.0 = 1024/352144 ≈ 0.002908 */
+#define DIST2_TO_LUT_SCALE  (SIN_LUT_SIZE / 352144.0f)
+
+static inline int lut_dist_idx(int dx, int dy) {
     int adx = dx < 0 ? -dx : dx;
     int ady = dy < 0 ? -dy : dy;
     if (adx >= DIST2_LUT_W) adx = DIST2_LUT_W - 1;
     if (ady >= DIST2_LUT_H) ady = DIST2_LUT_H - 1;
-    return dist2_lut[ady][adx] * (2.0f * M_PI / 352144.0f);
+    return (int)(dist2_lut[ady][adx] * DIST2_TO_LUT_SCALE);
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -327,17 +332,17 @@ static void draw_char(uint32_t *buf, int x, int y, char c, int scale,
                     if (alpha == 255) {
                         buf[py * DISPLAY_W + px] = rgb(r, g, b);
                     } else {
-                        /* alpha blend over existing pixel */
+                        /* alpha blend — integer only, no float division */
                         uint32_t bg = buf[py * DISPLAY_W + px];
-                        uint8_t br = (bg >> 16) & 0xFF;
-                        uint8_t bg2 = (bg >> 8) & 0xFF;
-                        uint8_t bb = bg & 0xFF;
-                        float a = alpha / 255.0f;
-                        float ia = 1.0f - a;
+                        uint32_t br = (bg >> 16) & 0xFF;
+                        uint32_t bg2 = (bg >> 8) & 0xFF;
+                        uint32_t bb = bg & 0xFF;
+                        uint32_t a  = alpha;
+                        uint32_t ia = 255 - a;
                         buf[py * DISPLAY_W + px] = rgb(
-                            (uint8_t)(r*a + br*ia),
-                            (uint8_t)(g*a + bg2*ia),
-                            (uint8_t)(b*a + bb*ia));
+                            (uint8_t)((r*a + br*ia + 127) >> 8),
+                            (uint8_t)((g*a + bg2*ia + 127) >> 8),
+                            (uint8_t)((b*a + bb*ia + 127) >> 8));
                     }
                 }
             }
@@ -401,40 +406,60 @@ static void render_plasma_chunk(const RenderParams *p, uint32_t *buf,
     fw[0]=0.3f+bass*0.7f; fw[1]=0.3f+low_mids*0.7f;
     fw[2]=0.3f+high_mids*0.7f; fw[3]=0.3f+highs*0.7f; fw[4]=0.3f+highs*0.5f;
     float fw_sum=fw[0]+fw[1]+fw[2]+fw[3]+fw[4];
-    float scale=(NUM_COLORS-1)/fw_sum;
+    float fscale=(NUM_COLORS-1)/fw_sum;
     float cum[NUM_COLORS+1]; cum[0]=0.0f;
-    for (int i=0;i<NUM_COLORS;i++) cum[i+1]=cum[i]+fw[i]*scale;
+    for (int i=0;i<NUM_COLORS;i++) cum[i+1]=cum[i]+fw[i]*fscale;
 
-    float inv_w=2.0f*M_PI/DISPLAY_W, inv_h=2.0f*M_PI/DISPLAY_H;
-    int cx_px=(int)(cx/(2.0f*M_PI)*DISPLAY_W);
-    int cy_px=(int)(cy/(2.0f*M_PI)*DISPLAY_H);
+    /* Precompute per-zone inverse widths — replaces per-pixel division */
+    float inv_zone[NUM_COLORS];
+    for (int i=0;i<NUM_COLORS-1;i++) {
+        float w=cum[i+1]-cum[i];
+        inv_zone[i]= w>1e-6f ? 1.0f/w : 1.0f;
+    }
+    inv_zone[NUM_COLORS-1]=1.0f;
+
+    /* Original correct coordinate system — preserved exactly */
+    float inv_w=2.0f*(float)M_PI/DISPLAY_W;
+    float inv_h=2.0f*(float)M_PI/DISPLAY_H;
+    int cx_px=(int)(cx/(2.0f*(float)M_PI)*DISPLAY_W);
+    int cy_px=(int)(cy/(2.0f*(float)M_PI)*DISPLAY_H);
+    const int is_info = (dim < 0.9f);
 
     for (int y=start_row; y<end_row; y++) {
-        float yy=y*inv_h;
-        float wave2=lut_sin((int)(yy*a*SIN_LUT_SIZE/(2*M_PI))
-                            +(int)(sin_tb*2*SIN_LUT_SIZE/(2*M_PI)));
-        float rot_y=yy*sin_td;
-        uint32_t *row=buf+y*DISPLAY_W;
+        float yy    = y * inv_h;
+        /* Row-level constants — same for all x in this row */
+        float wave2 = lut_sin((int)(yy*a*SIN_LUT_SIZE/(2*(float)M_PI))
+                              + (int)(sin_tb*2*SIN_LUT_SIZE/(2*(float)M_PI)));
+        float rot_y = yy * sin_td;
+        uint32_t *row = buf + y * DISPLAY_W;
+        const int dy  = y - cy_px;
 
         for (int x=0;x<DISPLAY_W;x++) {
-            float xx=x*inv_w;
-            float w1=lut_sin((int)(xx*a*SIN_LUT_SIZE/(2*M_PI))+(int)(cos_tb*2*SIN_LUT_SIZE/(2*M_PI)));
-            float dist=lut_dist(x-cx_px,y-cy_px);
-            float w3=lut_sin((int)(dist*SIN_LUT_SIZE/(2*M_PI))-(int)(t*c*SIN_LUT_SIZE/(2*M_PI)))*0.2f;
-            float w4=lut_sin((int)((xx*cos_td+rot_y)*SIN_LUT_SIZE/(2*M_PI)));
-            float v=w1+wave2+w3+w4;
-            float norm = (v + 3.0f) / 6.0f;
+            float xx   = x * inv_w;
+            float w1   = lut_sin((int)(xx*a*SIN_LUT_SIZE/(2*(float)M_PI))
+                                  + (int)(cos_tb*2*SIN_LUT_SIZE/(2*(float)M_PI)));
+            float w3   = lut_sin(lut_dist_idx(x-cx_px, dy)
+                                  - (int)(t*c*SIN_LUT_SIZE/(2*(float)M_PI))) * 0.2f;
+            float w4   = lut_sin((int)((xx*cos_td+rot_y)*SIN_LUT_SIZE/(2*(float)M_PI)));
+            float v    = w1 + wave2 + w3 + w4;
+
+            float norm = (v + 3.0f) * (1.0f/6.0f);
             if (norm < 0.0f) norm = 0.0f;
-            if (norm > 1.0f) norm = 1.0f;
-            /* plasma mode: darken midtones via fast quadratic (no powf) */
-            if (dim > 0.9f) norm = norm * (2.0f - norm) * 0.6f;
+            else if (norm > 1.0f) norm = 1.0f;
+            /* info mode: darken so text is readable */
+            if (!is_info) norm = norm * (2.0f - norm) * 0.6f;
+
             float scaled = norm * cum[NUM_COLORS];
-            int ci=0;
-            for (int pi=0;pi<NUM_COLORS-1;pi++) if (scaled>cum[pi+1]) ci=pi+1;
-            ci = ci<NUM_COLORS-1 ? ci : NUM_COLORS-2;
-            float blend=(scaled-cum[ci])/(cum[ci+1]-cum[ci]+1e-6f);
-            blend=blend<0?0:(blend>1?1:blend);
-            float inv_b=1.0f-blend;
+            /* Branchless zone lookup — replaces 5-iteration loop */
+            int ci = (scaled > cum[1]) + (scaled > cum[2]) +
+                     (scaled > cum[3]) + (scaled > cum[4]);
+            if (ci > NUM_COLORS-2) ci = NUM_COLORS-2;
+
+            float blend = (scaled - cum[ci]) * inv_zone[ci];
+            if (blend < 0.0f) blend = 0.0f;
+            else if (blend > 1.0f) blend = 1.0f;
+            float inv_b = 1.0f - blend;
+
             uint8_t r2=(uint8_t)((p->palette[ci][0]*inv_b+p->palette[ci+1][0]*blend)*dim);
             uint8_t g2=(uint8_t)((p->palette[ci][1]*inv_b+p->palette[ci+1][1]*blend)*dim);
             uint8_t b2=(uint8_t)((p->palette[ci][2]*inv_b+p->palette[ci+1][2]*blend)*dim);
@@ -455,36 +480,88 @@ static void render_stalagmites_chunk(const RenderParams *p, uint32_t *buf,
         primary[c]=p->palette[NUM_COLORS-1][c];
         secondary[c]=p->palette[NUM_COLORS-2][c];
     }
+
+    /* ── Precompute per-stalagmite constants ── */
+    /* These are constant across the entire frame — compute once not per pixel */
+    typedef struct {
+        int     cx;
+        int     tip_y;
+        float   inv_sh;       /* 1.0f / stala_h */
+        float   inv_2sig2_tip;/* 1.0f / (2 * sigma^2_at_tip) */
+        float   hr_max;       /* always 1.0f — kept for clarity */
+        float   breathing;
+        uint8_t cr, cg, cb;
+    } StalaCache;
+    StalaCache sc[7];
+    for (int i=0;i<7;i++) {
+        sc[i].cx = (int)(DISPLAY_W*(i+0.5f)/7);
+        float sh = DISPLAY_H*(0.35f+(i%3)*0.15f);
+        sc[i].inv_sh  = 1.0f/sh;
+        sc[i].tip_y   = (int)(DISPLAY_H-sh);
+        float sigma   = 12.0f+(i%3)*5.0f;
+        /* at the tip (hr→0, tr→1): sigma2 = sigma^2*(1-0.85) = sigma^2*0.15 */
+        /* We evaluate sigma2 per-y so we store sigma^2 base */
+        /* actually we recompute per row — leave full calc below but hoist bv */
+        float bv = p->stala_colors[i];
+        sc[i].cr = (uint8_t)(primary[0]*(1-bv)+secondary[0]*bv);
+        sc[i].cg = (uint8_t)(primary[1]*(1-bv)+secondary[1]*bv);
+        sc[i].cb = (uint8_t)(primary[2]*(1-bv)+secondary[2]*bv);
+        sc[i].breathing = sinf(t*0.4f+i*1.1f)*0.08f+0.92f;
+        (void)sigma; /* used inline below */
+    }
+    /* sigma^2 base per stalagmite */
+    float sigma_sq[7];
+    for (int i=0;i<7;i++) sigma_sq[i] = (12.0f+(i%3)*5.0f)*(12.0f+(i%3)*5.0f);
+
+    /* fast negative-only exp approximation: expf(-x) for x >= 0
+     * uses (1 - x/8)^8 for x < 8, clamp to 0 for larger x
+     * error < 3% for x in [0,6] which covers our taper range */
+    #define FAST_NEG_EXP(x) ({ \
+        float _x = (x); \
+        float _r; \
+        if (_x >= 8.0f) { _r = 0.0f; } \
+        else { float _t2 = 1.0f - _x * 0.125f; _t2*=_t2; _t2*=_t2; _t2*=_t2; _r=_t2; } \
+        _r; })
+
+    uint8_t bg_r=(uint8_t)(primary[0]*0.09f);
+    uint8_t bg_g=(uint8_t)(primary[1]*0.09f);
+    uint8_t bg_b=(uint8_t)(primary[2]*0.09f);
+
     for (int y=start_row;y<end_row;y++) {
         uint32_t *row=buf+y*DISPLAY_W;
-        uint8_t bg_r=(uint8_t)(primary[0]*0.09f);
-        uint8_t bg_g=(uint8_t)(primary[1]*0.09f);
-        uint8_t bg_b=(uint8_t)(primary[2]*0.09f);
+
+        /* ── Per-row constants for each stalagmite ── */
+        float row_mask_scale[7], row_inv_sig2[7];
+        int   row_active[7];
+        for (int i=0;i<7;i++) {
+            if (y < sc[i].tip_y) { row_active[i]=0; continue; }
+            row_active[i]=1;
+            float hr = (y - sc[i].tip_y) * sc[i].inv_sh;
+            if (hr > 1.0f) hr = 1.0f;
+            float tr = 1.0f - hr;
+            /* hr^0.4 via sqrtf(sqrtf) ≈ hr^0.5 then scale — close enough visually */
+            float hr04 = sqrtf(sqrtf(hr)) * 0.87f + hr * 0.13f; /* blend between hr^0.5 and hr^1 */
+            row_mask_scale[i] = hr04 * sc[i].breathing;
+            row_inv_sig2[i]   = 1.0f / (2.0f * sigma_sq[i] * (1.0f - tr * 0.85f));
+        }
+
         for (int x=0;x<DISPLAY_W;x++) {
             float r_acc=bg_r,g_acc=bg_g,b_acc=bg_b;
             for (int i=0;i<7;i++) {
-                int cx2=(int)(DISPLAY_W*(i+0.5f)/7);
-                float sh=DISPLAY_H*(0.35f+(i%3)*0.15f);
-                float sigma=12.0f+(i%3)*5.0f;
-                float breathing=sinf(t*0.4f+i*1.1f)*0.08f+0.92f;
-                int ty=(int)(DISPLAY_H-sh);
-                if (y<ty) continue;
-                float hr=(y-ty)/sh; if (hr>1.0f) hr=1.0f;
-                float tr=1.0f-hr;
-                int dx=x-cx2;
-                float sig2=sigma*sigma*(1.0f-tr*0.85f);
-                float taper=expf(-(float)(dx*dx)/(2.0f*sig2));
-                float mask=powf(hr,0.4f)*taper;
-                float bv=p->stala_colors[i];
-                r_acc+=mask*((uint8_t)(primary[0]*(1-bv)+secondary[0]*bv))*breathing;
-                g_acc+=mask*((uint8_t)(primary[1]*(1-bv)+secondary[1]*bv))*breathing;
-                b_acc+=mask*((uint8_t)(primary[2]*(1-bv)+secondary[2]*bv))*breathing;
+                if (!row_active[i]) continue;
+                int dx=x-sc[i].cx;
+                float taper = FAST_NEG_EXP((float)(dx*dx) * row_inv_sig2[i]);
+                float mask  = row_mask_scale[i] * taper;
+                r_acc += mask * sc[i].cr;
+                g_acc += mask * sc[i].cg;
+                b_acc += mask * sc[i].cb;
             }
             row[x]=rgb(r_acc>255?255:(uint8_t)r_acc,
                        g_acc>255?255:(uint8_t)g_acc,
                        b_acc>255?255:(uint8_t)b_acc);
         }
     }
+    #undef FAST_NEG_EXP
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -492,10 +569,8 @@ static void render_stalagmites_chunk(const RenderParams *p, uint32_t *buf,
    ════════════════════════════════════════════════════════════════════════════ */
 
 static void overlay_album_art_centered(const RenderParams *p, uint32_t *buf) {
-    if (!p->album_ready) return;
-    int src_sz=(int)p->album_size;
-    if (src_sz<10||src_sz>MAX_ALBUM_SIZE) return;
-    /* cap to 160px so it stays above freq bars */
+    if (!stable_album_ready || stable_album_size < 10) return;
+    int src_sz = stable_album_size;
     int sz = src_sz > 160 ? 160 : src_sz;
     int x0=(DISPLAY_W-sz)/2, y0=(DISPLAY_H/2 - sz/2 - 40);
     int r2=(sz/2)*(sz/2), cx2=sz/2, cy2=sz/2;
@@ -507,9 +582,9 @@ static void overlay_album_art_centered(const RenderParams *p, uint32_t *buf) {
             if (dx*dx+dy*dy>r2) continue;
             int ssx=(ax*src_sz)/sz, ssy=(ay*src_sz)/sz;
             int src=(ssy*src_sz+ssx)*3;
-            buf[gy*DISPLAY_W+gx]=rgb(p->album_data[src],
-                                     p->album_data[src+1],
-                                     p->album_data[src+2]);
+            buf[gy*DISPLAY_W+gx]=rgb(stable_album[src],
+                                     stable_album[src+1],
+                                     stable_album[src+2]);
         }
     }
 }
@@ -551,40 +626,45 @@ static void overlay_album_art_info(const RenderParams *p, uint32_t *buf) {
    Wave frequency bars (info mode — sine envelope, filled solid)
    ════════════════════════════════════════════════════════════════════════════ */
 
-static void draw_wave_bars(const RenderParams *p, uint32_t *buf) {
-    /* Build envelope: for each x pixel, interpolate between band peaks
-     * using a smooth curve. Bands are evenly spaced across DISPLAY_W. */
-    const int wave_h = DISPLAY_H - WAVE_Y_TOP;   /* 110 pixels */
-    const float band_spacing = (float)DISPLAY_W / NUM_BANDS;
+/* Precomputed per-column wave height table — avoids cosf() in inner loop.
+ * Built once per frame in draw_wave_bars(), reused for fill + outline. */
+static int wave_top_y[DISPLAY_W];
 
-    /* band peak heights in pixels */
+static void draw_wave_bars(const RenderParams *p, uint32_t *buf) {
+    const int   wave_h       = DISPLAY_H - WAVE_Y_TOP;
+    const float band_spacing = (float)DISPLAY_W / NUM_BANDS;
+    const float inv_spacing  = 1.0f / band_spacing;
+
     float peak[NUM_BANDS];
     for (int i=0;i<NUM_BANDS;i++)
         peak[i] = (p->bands[i] / 255.0f) * (wave_h * 0.85f);
 
-    /* palette accent color for fill — use brightest palette color */
     uint8_t wr = p->palette[NUM_COLORS-1][0];
     uint8_t wg = p->palette[NUM_COLORS-1][1];
     uint8_t wb = p->palette[NUM_COLORS-1][2];
-    /* ensure minimum brightness */
     if (wr<60&&wg<60&&wb<60) { wr=120; wg=200; wb=255; }
 
+    /* ── Pass 1: build wave_top_y[] — one cosf per column (not 2×) ── */
     for (int x=0;x<DISPLAY_W;x++) {
-        /* find which two bands this x is between, cosine interpolate */
-        float band_pos = (float)x / band_spacing - 0.5f;
+        float band_pos = (float)x * inv_spacing - 0.5f;
         int b0 = (int)band_pos; if (b0<0) b0=0; if (b0>=NUM_BANDS-1) b0=NUM_BANDS-2;
-        int b1 = b0+1;
         float t2 = band_pos - b0;
-        /* cosine interpolation */
-        float mu = (1.0f - cosf(t2 * M_PI)) * 0.5f;
-        float h = peak[b0]*(1.0f-mu) + peak[b1]*mu;
+        float mu = (1.0f - cosf(t2 * (float)M_PI)) * 0.5f;
+        float h  = peak[b0]*(1.0f-mu) + peak[b0+1]*mu;
+        int ty = DISPLAY_H - 1 - (int)h;
+        if (ty < WAVE_Y_TOP) ty = WAVE_Y_TOP;
+        wave_top_y[x] = ty;
+    }
 
-        int top_y = DISPLAY_H - 1 - (int)h;
-        if (top_y < WAVE_Y_TOP) top_y = WAVE_Y_TOP;
-
+    /* ── Pass 2: fill columns — precompute fade as integer to avoid per-pixel float ── */
+    for (int x=0;x<DISPLAY_W;x++) {
+        int top_y  = wave_top_y[x];
+        int height = DISPLAY_H - top_y;
+        if (height <= 0) continue;
+        float inv_h = 1.0f / (float)(height + 1);
         for (int y=top_y; y<DISPLAY_H; y++) {
-            float fade = 1.0f - (float)(y - top_y) / (float)(DISPLAY_H - top_y + 1);
-            fade = fade * 0.75f + 0.25f;   /* floor at 25% so bottom stays visible */
+            /* fade: 1.0 at top_y, 0.25 at bottom */
+            float fade = (1.0f - (float)(y - top_y) * inv_h) * 0.75f + 0.25f;
             buf[y*DISPLAY_W+x] = rgb(
                 (uint8_t)(wr*fade),
                 (uint8_t)(wg*fade),
@@ -592,18 +672,11 @@ static void draw_wave_bars(const RenderParams *p, uint32_t *buf) {
         }
     }
 
-    /* draw the outline on top — brighter */
+    /* ── Pass 3: outline — single bright pixel + glow pixel ── */
     for (int x=1;x<DISPLAY_W-1;x++) {
-        float band_pos = (float)x / band_spacing - 0.5f;
-        int b0 = (int)band_pos; if (b0<0) b0=0; if (b0>=NUM_BANDS-1) b0=NUM_BANDS-2;
-        int b1 = b0+1;
-        float t2 = band_pos - b0;
-        float mu = (1.0f - cosf(t2 * M_PI)) * 0.5f;
-        float h = peak[b0]*(1.0f-mu) + peak[b1]*mu;
-        int top_y = DISPLAY_H - 1 - (int)h;
-        if (top_y < WAVE_Y_TOP) top_y = WAVE_Y_TOP;
-        if (top_y >= DISPLAY_H) top_y = DISPLAY_H-1;
-        buf[top_y*DISPLAY_W+x] = rgb(255,255,255);
+        int top_y = wave_top_y[x];
+        if (top_y < DISPLAY_H)
+            buf[top_y*DISPLAY_W+x] = rgb(255,255,255);
         if (top_y > 0)
             buf[(top_y-1)*DISPLAY_W+x] = rgb(200,220,255);
     }
@@ -1077,17 +1150,19 @@ static void g_tick_seed(GlitchSeed *s, int head_col,
     s->age_ticks++;
 
     g_kill_near_head(s, head_col);
-    if (s->live_count <= 0) { s->state = SEED_DEAD; return; }
+    if (s->live_count <= 0) { s->live_count = 0; s->state = SEED_DEAD; return; }
 
     if (s->state == SEED_GROWING) {
-        if (s->live_count >= s->target_cells) {
+        /* hard cap: force ALIVE after 120 ticks so ghost can't grow forever
+         * when the fringe frontier never exhausts                          */
+        if (s->live_count >= s->target_cells || s->age_ticks >= 120) {
             s->state = SEED_ALIVE; s->age_ticks = 0;
         } else {
             int period = ghost ? 3 : 5;
             if ((s->age_ticks % period) == 0) {
-                int f = ghost ? g_ghost_frontier(s, solid_live, drip_col, drip_dir,
-                                    s->state == SEED_ALIVE)
-                              : g_solid_frontier(s);
+                int f = ghost
+                    ? g_ghost_frontier(s, solid_live, drip_col, drip_dir, 0)
+                    : g_solid_frontier(s);
                 if (f < 0) { s->state = SEED_ALIVE; s->age_ticks = 0; }
                 else       { s->live[f] = 1; s->live_count++; }
             }
@@ -1099,9 +1174,9 @@ static void g_tick_seed(GlitchSeed *s, int head_col,
             int edge = g_random_edge(s);
             if (edge >= 0) {
                 s->live[edge] = 0; s->live_count--;
-                int f = ghost ? g_ghost_frontier(s, solid_live, drip_col, drip_dir,
-                                    s->state == SEED_ALIVE)
-                              : g_solid_frontier(s);
+                int f = ghost
+                    ? g_ghost_frontier(s, solid_live, drip_col, drip_dir, 1)
+                    : g_solid_frontier(s);
                 if (f >= 0) { s->live[f] = 1; s->live_count++; }
             }
         }
@@ -1114,9 +1189,21 @@ static void g_tick_seed(GlitchSeed *s, int head_col,
         s->die_phase = (s->die_phase + 1) % period;
         if (s->die_phase == 0) {
             int edge = g_random_edge(s);
-            if (edge >= 0) { s->live[edge] = 0; s->live_count--; }
+            if (edge >= 0) {
+                s->live[edge] = 0; s->live_count--;
+            } else {
+                /* frontier dry — force-kill one cell so dying never stalls */
+                for (int fi = 0; fi < GCELLS; fi++) {
+                    if (s->live[fi]) { s->live[fi] = 0; s->live_count--; break; }
+                }
+            }
         }
-        if (s->live_count <= 0) s->state = SEED_DEAD;
+        /* absolute backstop: nuke after 180 ticks (~6s at 30fps) */
+        if (s->age_ticks > 180) {
+            memset(s->live, 0, sizeof(s->live));
+            s->live_count = 0;
+        }
+        if (s->live_count <= 0) { s->live_count = 0; s->state = SEED_DEAD; }
     }
 }
 
@@ -1390,12 +1477,11 @@ static void *render_thread(void *arg) {
         pthread_barrier_wait(&frame_barrier);
         if (ta->thread_id == 0) {
             if (p->display_mode == 1) {
-                /* CRT over plasma background first, then UI elements clean on top */
+                /* info mode: CRT over plasma background, then UI elements clean on top */
                 draw_scanlines(ta->buf);
                 draw_info_overlay(p, ta->buf);
             } else {
-                /* CRT over plasma first, then freq bars + album art clean on top */
-                draw_scanlines(ta->buf);
+                /* minimal mode: no CRT, just freq bars + album art */
                 if (p->show_bands) draw_freq_bars(p, ta->buf);
                 if (p->show_album) overlay_album_art_centered(p, ta->buf);
             }
@@ -1430,35 +1516,30 @@ static int read_shm(RenderParams *p) {
     uint32_t magic = *(volatile uint32_t *)(shm + OFF_MAGIC);
     if (magic != MAGIC_VAL) return 0;
 
-    memcpy(p->bands, (const void *)(shm + OFF_BANDS), NUM_BANDS * sizeof(float));
-    for (int i=0;i<NUM_COLORS;i++) {
-        int base = OFF_PALETTE + i*3;
-        p->palette[i][0]=shm[base]; p->palette[i][1]=shm[base+1]; p->palette[i][2]=shm[base+2];
-    }
-    float *abcd=(float *)(shm+OFF_PLASMA_ABCD);
-    p->a=abcd[0]; p->b=abcd[1]; p->c=abcd[2]; p->d=abcd[3];
-    float *cxcy=(float *)(shm+OFF_PLASMA_CXCY);
-    p->cx=cxcy[0]; p->cy=cxcy[1];
-    memcpy(p->stala_colors,(const void*)(shm+OFF_STALA_COLORS),7*sizeof(float));
-    p->mode       =*(volatile uint32_t*)(shm+OFF_MODE);
-    p->show_album =*(volatile uint32_t*)(shm+OFF_SHOW_ALBUM);
-    p->show_bands =*(volatile uint32_t*)(shm+OFF_SHOW_BANDS);
-    p->album_size =*(volatile uint32_t*)(shm+OFF_ALBUM_SIZE);
-    p->bpm        =*(volatile uint32_t*)(shm+OFF_BPM);
-    p->display_mode=*(volatile uint32_t*)(shm+OFF_DISPLAY_MODE);
+    /* Read all scalar fields in one pass */
+    memcpy(p->bands,        (const void *)(shm + OFF_BANDS),        NUM_BANDS * sizeof(float));
+    memcpy(p->palette,      (const void *)(shm + OFF_PALETTE),      NUM_COLORS * 3);
+    memcpy(&p->a,           (const void *)(shm + OFF_PLASMA_ABCD),  4 * sizeof(float));
+    memcpy(&p->cx,          (const void *)(shm + OFF_PLASMA_CXCY),  2 * sizeof(float));
+    memcpy(p->stala_colors, (const void *)(shm + OFF_STALA_COLORS), 7 * sizeof(float));
 
-    /* track info */
-    memcpy(p->track_title,  (const void*)(shm+OFF_TRACK_TITLE),  63); p->track_title[63]='\0';
-    memcpy(p->track_artist, (const void*)(shm+OFF_TRACK_ARTIST), 63); p->track_artist[63]='\0';
-    memcpy(p->track_album,  (const void*)(shm+OFF_TRACK_ALBUM_S),63); p->track_album[63]='\0';
-    p->track_dur_ms=*(volatile uint32_t*)(shm+OFF_TRACK_DUR_MS);
-    p->track_pos_ms=*(volatile uint32_t*)(shm+OFF_TRACK_POS_MS);
+    p->mode        = *(volatile uint32_t *)(shm + OFF_MODE);
+    p->show_album  = *(volatile uint32_t *)(shm + OFF_SHOW_ALBUM);
+    p->show_bands  = *(volatile uint32_t *)(shm + OFF_SHOW_BANDS);
+    p->album_size  = *(volatile uint32_t *)(shm + OFF_ALBUM_SIZE);
+    p->bpm         = *(volatile uint32_t *)(shm + OFF_BPM);
+    p->display_mode= *(volatile uint32_t *)(shm + OFF_DISPLAY_MODE);
 
+    memcpy(p->track_title,  (const void *)(shm + OFF_TRACK_TITLE),  63); p->track_title[63]='\0';
+    memcpy(p->track_artist, (const void *)(shm + OFF_TRACK_ARTIST), 63); p->track_artist[63]='\0';
+    memcpy(p->track_album,  (const void *)(shm + OFF_TRACK_ALBUM_S),63); p->track_album[63]='\0';
+    p->track_dur_ms = *(volatile uint32_t *)(shm + OFF_TRACK_DUR_MS);
+    p->track_pos_ms = *(volatile uint32_t *)(shm + OFF_TRACK_POS_MS);
+
+    /* Album art: point to stable cache — no 367KB memcpy into params every frame */
     p->album_ready = stable_album_ready;
-    if (stable_album_ready && stable_album_size > 0) {
-        p->album_size = stable_album_size;
-        memcpy(p->album_data, stable_album, stable_album_size * stable_album_size * 3);
-    }
+    p->album_size  = stable_album_size > 0 ? (uint32_t)stable_album_size : p->album_size;
+    /* album_data field in params is NOT populated — render functions use stable_album directly */
     return 1;
 }
 

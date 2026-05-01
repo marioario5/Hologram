@@ -3,158 +3,726 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hologram Visualizer Control</title>
+    <title>HOLOGRAM // CTRL</title>
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
     <style>
-        body {
-            font-family: 'Courier New', monospace;
-            background: #000;
-            color: #0f0;
-            margin: 0;
-            padding: 20px;
+        :root {
+            --pink:   #FF00B3;
+            --cyan:   #00FFFF;
+            --bg:     #0A0612;
+            --srf:    #1A112C;
+            --white:  #FFFFFF;
+            --t2:     #A388CC;
+            --bord:   #3A285C;
+            --green:  #39FF14;
+            --yel:    #FFB800;
+            --red:    #FF0033;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body {
+            background: var(--bg);
+            color: var(--white);
+            font-family: 'Press Start 2P', monospace;
+            font-size: 12px;
             min-height: 100vh;
+            overflow-x: hidden;
+            position: relative;
         }
+
+        /* ── WRAPPER ── */
+        #bg-wrap {
+            position: absolute;
+            inset: 0;
+            min-height: 100%;
+            pointer-events: none;
+            overflow: hidden;
+        }
+
+        /* ── CITYSCAPE CANVAS ── */
+        #city-canvas {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 0;
+            pointer-events: none;
+        }
+
+        /* ── SCANLINES ── */
+        #scanlines {
+            position: absolute;
+            inset: 0;
+            background: repeating-linear-gradient(
+                0deg,
+                transparent 0px,
+                transparent 2px,
+                rgba(0,0,0,0.18) 2px,
+                rgba(0,0,0,0.18) 4px
+            );
+            pointer-events: none;
+            z-index: 2;
+        }
+
+        /* ── VIGNETTE ── */
+        #vignette {
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(ellipse at center, transparent 40%, rgba(10,6,18,0.85) 100%);
+            pointer-events: none;
+            z-index: 3;
+        }
+
+        /* ── CONTENT ── */
+        .page {
+            position: relative;
+            z-index: 10;
+            padding: 24px 16px 64px;
+        }
+
         .container {
-            max-width: 600px;
+            max-width: 520px;
             margin: 0 auto;
-            background: #111;
-            border: 1px solid #0f0;
-            padding: 20px;
-            border-radius: 5px;
         }
-        h1 { text-align: center; color: #0f0; margin-bottom: 30px; text-shadow: 0 0 10px #0f0; }
-        .status {
-            background: #222; border: 1px solid #333;
-            padding: 15px; margin-bottom: 20px;
-            border-radius: 3px; font-size: 14px; line-height: 1.6;
+
+        /* ── HEADER ── */
+        .header {
+            text-align: center;
+            padding: 32px 24px 24px;
+            border: 2px solid var(--pink);
+            background: rgba(26,17,44,0.92);
+            position: relative;
+            margin-bottom: 16px;
+            box-shadow: 0 0 15px rgba(255,0,179,0.8), 0 0 30px rgba(255,0,179,0.4), inset 0 0 40px rgba(255,0,179,0.06);
         }
-        .control { margin-bottom: 20px; }
-        .control h3 { margin: 0 0 10px 0; color: #0f0; }
-        button {
-            background: #0f0; color: #000; border: none;
-            padding: 10px 20px; font-size: 16px;
-            font-family: inherit; cursor: pointer;
-            border-radius: 3px; width: 100%; margin-bottom: 10px;
+        .header::before { content:''; position:absolute; top:-2px; left:-2px; width:10px; height:10px; background:var(--pink); }
+        .header::after  { content:''; position:absolute; bottom:-2px; right:-2px; width:10px; height:10px; background:var(--pink); }
+        .hc1 { position:absolute; top:-2px; right:-2px; width:10px; height:10px; background:var(--cyan); }
+        .hc2 { position:absolute; bottom:-2px; left:-2px; width:10px; height:10px; background:var(--cyan); }
+
+        .eyebrow { font-size: 8px; color: var(--t2); letter-spacing: 0.3em; margin-bottom: 16px; }
+        h1 {
+            font-size: clamp(13px, 3.2vw, 20px);
+            color: var(--pink);
+            text-shadow: 0 0 15px rgba(255,0,179,0.9), 0 0 40px rgba(255,0,179,0.5);
+            line-height: 2;
         }
-        button:hover { background: #0a0; }
-        button:disabled { background: #333; color: #666; cursor: not-allowed; }
-        .toggle { display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 16px; }
-        .switch { position: relative; display: inline-block; width: 50px; height: 25px; }
-        .switch input { opacity: 0; width: 0; height: 0; }
-        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #333; transition: .4s; border-radius: 25px; }
-        .slider:before { position: absolute; content: ""; height: 19px; width: 19px; left: 3px; bottom: 3px; background-color: #0f0; transition: .4s; border-radius: 50%; }
-        input:checked + .slider { background-color: #005500; }
-        input:checked + .slider:before { transform: translateX(25px); }
-        .message { padding: 10px; margin-top: 10px; border-radius: 3px; text-align: center; font-weight: bold; }
-        .message.success { background: #0a0; color: #000; }
-        .message.error { background: #a00; color: #fff; }
-        .divider { border: none; border-top: 1px solid #333; margin: 15px 0; }
+        .h1-sub {
+            display: block;
+            font-size: clamp(10px, 2.5vw, 14px);
+            color: var(--cyan);
+            text-shadow: 0 0 10px rgba(0,255,255,0.7);
+            margin-top: 4px;
+        }
+        .hline {
+            display: flex; align-items: center; gap: 8px; margin-top: 16px;
+        }
+        .hline .ln { flex:1; height:2px; background: linear-gradient(90deg, transparent, var(--bord), transparent); }
+        .hline span { font-size: 7px; color: var(--bord); letter-spacing: 0.25em; }
+
+        /* ── CARD ── */
+        .card {
+            background: rgba(26,17,44,0.92);
+            border: 2px solid var(--bord);
+            border-top: 2px solid var(--cyan);
+            position: relative;
+            margin-bottom: 16px;
+            box-shadow: 0 0 4px rgba(0,255,255,0.4);
+        }
+        .card::after { content:''; position:absolute; bottom:-2px; right:-2px; width:8px; height:8px; background:var(--cyan); opacity:0.7; }
+        .card-hdr {
+            display: flex; align-items: center; gap: 8px;
+            padding: 10px 16px;
+            border-bottom: 1px solid var(--bord);
+            background: rgba(0,255,255,0.04);
+        }
+        .card-lbl { font-size: 8px; letter-spacing: 0.28em; color: var(--cyan); }
+        .card-tag { margin-left:auto; font-size:7px; letter-spacing:0.18em; color:var(--t2); border:1px solid var(--bord); padding:2px 6px; }
+        .card-body { padding: 16px; }
+
+        /* ── BLINKER ── */
+        .bk { width:6px; height:6px; flex-shrink:0; }
+        .bk.c { background:var(--cyan); box-shadow:0 0 6px var(--cyan); animation:bk 1.4s step-end infinite; }
+        .bk.p { background:var(--pink); box-shadow:0 0 6px var(--pink); animation:bk 1.4s step-end infinite; }
+        .bk.g { background:var(--green); box-shadow:0 0 6px var(--green); animation:bk 1.2s step-end infinite; }
+        .bk.off { background:var(--bord); }
+        @keyframes bk { 0%,100%{opacity:1} 50%{opacity:0} }
+
+        /* ── STAT GRID ── */
+        .sg { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+        .st { border:1px solid var(--bord); padding:8px 12px; background:rgba(0,0,0,0.4); position:relative; }
+        .st::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:var(--pink); opacity:0.25; }
+        .st.full { grid-column:1/-1; }
+        .sl { font-size:7px; color:var(--t2); letter-spacing:0.2em; margin-bottom:5px; }
+        .sv { font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .sv.c  { color:var(--cyan);  text-shadow:0 0 4px rgba(0,255,255,0.5); }
+        .sv.p  { color:var(--pink);  text-shadow:0 0 4px rgba(255,0,179,0.5); }
+        .sv.g  { color:var(--green); text-shadow:0 0 4px rgba(57,255,20,0.5); animation:bk 1.2s step-end infinite; }
+        .sv.y  { color:var(--yel);   text-shadow:0 0 4px rgba(255,184,0,0.4); animation:bk 1.4s step-end infinite; }
+        .sv.d  { color:var(--bord); }
+        .sv.e  { color:var(--red);   animation:bk 0.6s step-end infinite; }
+
+        /* ── TOGGLE ROW ── */
+        .tr { display:flex; align-items:center; justify-content:space-between; padding:12px 0; border-bottom:1px solid var(--bord); }
+        .tr:last-child { border-bottom:none; padding-bottom:0; }
+        .tr:first-child { padding-top:0; }
+        .tl { font-size:9px; letter-spacing:0.14em; color:var(--t2); }
+        .to { display:flex; align-items:center; gap:8px; font-size:8px; letter-spacing:0.14em; }
+        .op { color:var(--bord); transition:color 0.1s,text-shadow 0.1s; }
+        .op.oc { color:var(--cyan); text-shadow:0 0 5px rgba(0,255,255,0.5); }
+        .op.op2 { color:var(--pink); text-shadow:0 0 5px rgba(255,0,179,0.5); }
+
+        /* pixel toggle */
+        .ptog { position:relative; width:40px; height:20px; flex-shrink:0; cursor:pointer; }
+        .ptog input { position:absolute; opacity:0; width:0; height:0; }
+        .ptrk { position:absolute; inset:0; background:var(--bg); border:2px solid var(--bord); transition:border-color 0.15s; }
+        .pknb { position:absolute; top:3px; left:3px; width:10px; height:10px; background:var(--bord); transition:transform 0.15s,background 0.15s,box-shadow 0.15s; }
+        .ptog input:checked ~ .ptrk { border-color:var(--pink); }
+        .ptog input:checked ~ .ptrk .pknb { transform:translateX(20px); background:var(--pink); box-shadow:0 0 6px var(--pink); }
+
+        /* ── BUTTON ── */
+        .btn {
+            display:block; width:100%; padding:12px 16px;
+            background:transparent; border:2px solid var(--bord);
+            color:var(--t2); font-family:'Press Start 2P',monospace;
+            font-size:9px; letter-spacing:0.22em; cursor:pointer;
+            transition:border-color 0.1s,color 0.1s,box-shadow 0.1s,background 0.1s;
+            text-align:center; position:relative;
+        }
+        .btn:not(:disabled):hover {
+            border-color:var(--pink); color:var(--pink);
+            box-shadow:0 0 10px rgba(255,0,179,0.6);
+            background:rgba(255,0,179,0.06);
+        }
+        .btn:disabled { opacity:0.22; cursor:not-allowed; }
+        .btn::before,.btn::after { content:''; position:absolute; width:5px; height:5px; opacity:0; transition:opacity 0.1s; }
+        .btn::before { top:-2px; left:-2px; background:var(--pink); }
+        .btn::after  { bottom:-2px; right:-2px; background:var(--pink); }
+        .btn:not(:disabled):hover::before,.btn:not(:disabled):hover::after { opacity:1; }
+
+        /* ── TOAST ── */
+        #twrap { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); z-index:9999; pointer-events:none; }
+        .toast { padding:10px 16px; font-size:8px; letter-spacing:0.2em; border:2px solid; white-space:nowrap; }
+        .toast.ok  { background:rgba(57,255,20,0.1);  border-color:var(--green); color:var(--green); }
+        .toast.err { background:rgba(255,0,51,0.1);   border-color:var(--red);   color:var(--red); }
+
+        /* ── FOOTER ── */
+        .footer { text-align:center; margin-top:32px; font-size:7px; letter-spacing:0.3em; color:var(--bord); }
+        .footer span { color:var(--pink); }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🎵 Hologram Visualizer Control 🎵</h1>
 
-        <div class="status" id="status">Loading status...</div>
+<div id="bg-wrap">
+<canvas id="city-canvas"></canvas>
+<div id="scanlines"></div>
+<div id="vignette"></div>
+</div>
 
-        <div class="control">
-            <h3>Display Mode</h3>
-            <div class="toggle">
-                <span>Plasma</span>
-                <label class="switch">
-                    <input type="checkbox" id="displayToggle" onchange="toggleDisplay()">
-                    <span class="slider"></span>
-                </label>
-                <span>Info</span>
-            </div>
-        </div>
+<div class="page">
+<div class="container">
 
-        <hr class="divider">
-
-        <div class="control">
-            <h3>Visualizer Style</h3>
-            <div class="toggle">
-                <span>Plasma</span>
-                <label class="switch">
-                    <input type="checkbox" id="modeToggle" onchange="toggleMode()">
-                    <span class="slider"></span>
-                </label>
-                <span>Stalagmite</span>
-            </div>
-        </div>
-
-        <hr class="divider">
-
-        <div class="control">
-            <h3>Fingerprint Learning</h3>
-            <button id="learnBtn" onclick="learnTrack()">🎵 Learn Current Track</button>
-        </div>
-
-        <div id="message"></div>
+    <div class="header">
+        <div class="hc1"></div><div class="hc2"></div>
+        <p class="eyebrow">SYSTEM v3.0 // NODE-01 // 2026.04</p>
+        <h1>HOLOGRAM<br><span class="h1-sub">// VISUALIZER</span></h1>
+        <div class="hline"><div class="ln"></div><span>CTRL PANEL</span><div class="ln"></div></div>
     </div>
 
-    <script>
-        async function updateStatus() {
-            try {
-                const r = await fetch('/status');
-                const d = await r.json();
-                document.getElementById('status').innerHTML =
-                    `<strong>Input Mode:</strong> ${d.mode}<br>
-                     <strong>Current Track:</strong> ${d.track || 'None'}<br>
-                     <strong>BPM:</strong> ${d.bpm}<br>
-                     <strong>Visualizer Style:</strong> ${d.visualizer_mode}<br>
-                     <strong>Display Mode:</strong> ${d.display_mode === 1 ? 'Info' : 'Plasma'}<br>
-                     <strong>Learning:</strong> ${d.learning ? 'Active' : 'Inactive'}<br>
-                     <strong>Fingerprinting:</strong> ${d.fingerprinting ? 'Active' : 'Inactive'}`;
-                document.getElementById('modeToggle').checked = d.visualizer_mode === 'stalagmite';
-                document.getElementById('displayToggle').checked = d.display_mode === 1;
-                document.getElementById('learnBtn').disabled = d.mode !== 'vinyl';
-            } catch (e) {
-                document.getElementById('status').innerHTML = 'Error loading status';
+    <div class="card" id="telemCard">
+        <div class="card-hdr">
+            <div class="bk c" id="tblink"></div>
+            <span class="card-lbl">TELEMETRY</span>
+            <span class="card-tag">LIVE</span>
+        </div>
+        <div class="card-body">
+            <div class="sg" id="sg">
+                <div class="st full"><div class="sl">STATUS</div><div class="sv d">CONNECTING...</div></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-hdr">
+            <div class="bk c"></div>
+            <span class="card-lbl">RENDER CONFIG</span>
+            <span class="card-tag">SHM WRITE</span>
+        </div>
+        <div class="card-body">
+            <div class="tr">
+                <span class="tl">DISPLAY MODE</span>
+                <div class="to">
+                    <span class="op oc" id="op-plasma">PLASMA</span>
+                    <label class="ptog">
+                        <input type="checkbox" id="displayToggle" onchange="toggleDisplay()">
+                        <div class="ptrk"><div class="pknb"></div></div>
+                    </label>
+                    <span class="op" id="op-info">INFO</span>
+                </div>
+            </div>
+            <div class="tr">
+                <span class="tl">VIZ STYLE</span>
+                <div class="to">
+                    <span class="op oc" id="op-p2">PLASMA</span>
+                    <label class="ptog">
+                        <input type="checkbox" id="modeToggle" onchange="toggleMode()">
+                        <div class="ptrk"><div class="pknb"></div></div>
+                    </label>
+                    <span class="op" id="op-st">STALA</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-hdr">
+            <div class="bk p"></div>
+            <span class="card-lbl">FINGERPRINT</span>
+            <span class="card-tag">VINYL ONLY</span>
+        </div>
+        <div class="card-body">
+            <button class="btn" id="learnBtn" onclick="learnTrack()" disabled>[ LEARN CURRENT TRACK ]</button>
+        </div>
+    </div>
+
+    <div class="footer">INSERT COIN &nbsp;<span>▶</span>&nbsp; AUTO-REFRESH 2s</div>
+</div>
+</div>
+
+<div id="twrap"></div>
+
+<script>
+/* ════════════════════════════════════════════════════
+   PIXEL CITYSCAPE RENDERER
+   ════════════════════════════════════════════════════ */
+(function() {
+    const c = document.getElementById('city-canvas');
+    const ctx = c.getContext('2d');
+    let W, H, t = 0;
+
+    const PINK  = '#FF00B3';
+    const CYAN  = '#00FFFF';
+    const YEL   = '#FFB800';
+    const PURP  = '#8B00FF';
+    const BG    = '#0A0612';
+
+    /* deterministic pseudo-random from seed */
+    function rng(seed) {
+        let s = seed * 2654435761 >>> 0;
+        return (s ^ (s >>> 16)) / 4294967296;
+    }
+
+    function resize() {
+        W = c.width  = document.body.scrollWidth || window.innerWidth;
+        H = c.height = Math.max(document.body.scrollHeight, window.innerHeight);
+        const wrap = document.getElementById('bg-wrap');
+        if (wrap) { wrap.style.width = W + 'px'; wrap.style.height = H + 'px'; }
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    /* ── Building data (generated once) ── */
+    const BUILDINGS = [];
+    for (let i = 0; i < 34; i++) {
+        const x = (i / 34) * 1.15 * 1920 - 30;
+        const w = 28 + rng(i * 7 + 1) * 60;
+        const h = 80 + rng(i * 7 + 2) * 420;
+        const layer = rng(i * 7 + 3) < 0.4 ? 0 : (rng(i * 7 + 4) < 0.5 ? 1 : 2);
+        const col = [
+            ['#0d0820','#12092a','#0a0518'],
+            ['#130d28','#1a1038','#0f0a20'],
+            ['#1c1240','#231548','#160e35']
+        ][layer];
+        const fillCol = col[Math.floor(rng(i * 7 + 5) * 3)];
+
+        /* windows */
+        const wins = [];
+        const wCols = Math.max(2, Math.floor(w / 10));
+        const wRows = Math.max(3, Math.floor(h / 14));
+        for (let wr = 0; wr < wRows; wr++) {
+            for (let wc = 0; wc < wCols; wc++) {
+                const on = rng(i * 1000 + wr * 50 + wc) > 0.55;
+                if (!on) continue;
+                const wColor = rng(i * 1000 + wr * 50 + wc + 0.1) < 0.15 ? CYAN :
+                               rng(i * 1000 + wr * 50 + wc + 0.2) < 0.1  ? PINK :
+                               rng(i * 1000 + wr * 50 + wc + 0.3) < 0.08 ? YEL  : '#5a4080';
+                wins.push({ c: wc, r: wr, col: wColor });
             }
         }
 
-        async function toggleDisplay() {
-            const dm = document.getElementById('displayToggle').checked ? 1 : 0;
-            try {
-                const r = await fetch('/display', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({display_mode: dm})
-                });
-                const d = await r.json();
-                showMessage(d.status, r.ok ? 'success' : 'error');
-            } catch (e) { showMessage('Network error', 'error'); }
+        /* antenna */
+        const hasAnt = rng(i * 7 + 6) > 0.5;
+
+        /* billboard */
+        const hasBB = rng(i * 7 + 7) > 0.65 && h > 180;
+        const bbType = Math.floor(rng(i * 7 + 8) * 4); /* 0=spectrum,1=text,2=bars,3=grid */
+
+        BUILDINGS.push({ x, w, h, layer, fill: fillCol, wins, wCols, wRows, hasAnt, hasBB, bbType });
+    }
+
+    /* neon signs */
+    const SIGNS = [];
+    for (let i = 0; i < 8; i++) {
+        SIGNS.push({
+            x: 80 + rng(i * 13 + 1) * 0.85 * 1920,
+            y: 0.3 + rng(i * 13 + 2) * 0.35,
+            text: ['HOTEL','CYBER','NOODLES','CLUB','DATA','SYNTH','NEO','RELOAD'][i],
+            col: [PINK, CYAN, YEL, PURP, CYAN, PINK, YEL, CYAN][i],
+            phase: rng(i * 13 + 3) * Math.PI * 2,
+            speed: 0.8 + rng(i * 13 + 4) * 1.5
+        });
+    }
+
+    /* flying particles */
+    const PARTICLES = [];
+    for (let i = 0; i < 60; i++) {
+        PARTICLES.push({
+            x: rng(i * 17 + 1) * 1920,
+            y: rng(i * 17 + 2) * 0.6,
+            vx: (rng(i * 17 + 3) - 0.3) * 1.2,
+            vy: (rng(i * 17 + 4) - 0.5) * 0.4,
+            col: rng(i * 17 + 5) < 0.5 ? CYAN : PINK,
+            size: 1 + rng(i * 17 + 6) * 2
+        });
+    }
+
+    /* vertical light beams */
+    const BEAMS = [];
+    for (let i = 0; i < 6; i++) {
+        BEAMS.push({
+            x: 0.1 + rng(i * 23 + 1) * 0.8,
+            col: rng(i * 23 + 2) < 0.5 ? CYAN : PINK,
+            phase: rng(i * 23 + 3) * Math.PI * 2,
+            speed: 0.3 + rng(i * 23 + 4) * 0.5
+        });
+    }
+
+    /* window flicker state */
+    const flickerState = {};
+
+    function drawBillboard(ctx, bx, by, bw, bh, type, t2, i) {
+        const bbW = Math.min(bw * 0.85, 80);
+        const bbH = 28;
+        const bbX = bx + (bw - bbW) / 2;
+        const bbY = by - 20;
+
+        ctx.fillStyle = '#0d0820';
+        ctx.strokeStyle = PINK;
+        ctx.lineWidth = 1.5;
+        ctx.fillRect(bbX, bbY, bbW, bbH);
+        ctx.strokeRect(bbX, bbY, bbW, bbH);
+
+        /* corner pixels */
+        ctx.fillStyle = PINK;
+        ctx.fillRect(bbX - 2, bbY - 2, 4, 4);
+        ctx.fillRect(bbX + bbW - 2, bbY - 2, 4, 4);
+        ctx.fillRect(bbX - 2, bbY + bbH - 2, 4, 4);
+        ctx.fillRect(bbX + bbW - 2, bbY + bbH - 2, 4, 4);
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(bbX + 2, bbY + 2, bbW - 4, bbH - 4);
+        ctx.clip();
+
+        if (type === 0) {
+            /* spectrum bars */
+            const bars = 10;
+            for (let b = 0; b < bars; b++) {
+                const barH = 4 + Math.abs(Math.sin(t2 * (0.8 + b * 0.15) + b * 0.7)) * (bbH - 10);
+                const hue = (b / bars);
+                ctx.fillStyle = hue < 0.5 ? CYAN : PINK;
+                ctx.globalAlpha = 0.7 + 0.3 * Math.sin(t2 * 2 + b);
+                ctx.fillRect(bbX + 3 + b * (bbW - 6) / bars, bbY + bbH - 4 - barH, (bbW - 6) / bars - 1, barH);
+            }
+            ctx.globalAlpha = 1;
+        } else if (type === 1) {
+            /* scrolling text */
+            ctx.font = 'bold 7px monospace';
+            ctx.fillStyle = CYAN;
+            const texts = ['SYSTEM OK','TRACK ID','HOLOGRAM','2099'];
+            const tx = texts[i % texts.length];
+            const scroll = ((t2 * 20) % (bbW + 60)) - 10;
+            ctx.fillText(tx, bbX + bbW - scroll, bbY + bbH / 2 + 3);
+        } else if (type === 2) {
+            /* grid pattern */
+            ctx.strokeStyle = PURP;
+            ctx.lineWidth = 0.5;
+            ctx.globalAlpha = 0.5 + 0.3 * Math.sin(t2 * 1.2);
+            for (let gx = bbX + 4; gx < bbX + bbW - 4; gx += 6)  { ctx.beginPath(); ctx.moveTo(gx, bbY + 2); ctx.lineTo(gx, bbY + bbH - 2); ctx.stroke(); }
+            for (let gy = bbY + 4; gy < bbY + bbH - 4; gy += 6)  { ctx.beginPath(); ctx.moveTo(bbX + 2, gy); ctx.lineTo(bbX + bbW - 2, gy); ctx.stroke(); }
+            ctx.globalAlpha = 1;
+        } else {
+            /* pulsing circle */
+            const cx2 = bbX + bbW / 2;
+            const cy2 = bbY + bbH / 2;
+            const r2 = (bbH / 2 - 3) * (0.6 + 0.4 * Math.sin(t2 * 1.8));
+            ctx.strokeStyle = CYAN;
+            ctx.lineWidth = 1.5;
+            ctx.globalAlpha = 0.8;
+            ctx.beginPath(); ctx.arc(cx2, cy2, r2, 0, Math.PI * 2); ctx.stroke();
+            ctx.globalAlpha = 0.3;
+            ctx.beginPath(); ctx.arc(cx2, cy2, r2 * 0.5, 0, Math.PI * 2); ctx.stroke();
+            ctx.globalAlpha = 1;
+        }
+        ctx.restore();
+    }
+
+    function frame() {
+        t += 0.016;
+        ctx.clearRect(0, 0, W, H);
+
+        /* sky gradient — deep purple to dark */
+        const sky = ctx.createLinearGradient(0, 0, 0, H);
+        sky.addColorStop(0, '#06030f');
+        sky.addColorStop(0.4, '#0d0520');
+        sky.addColorStop(1, BG);
+        ctx.fillStyle = sky;
+        ctx.fillRect(0, 0, W, H);
+
+        /* distant atmospheric haze band */
+        const haze = ctx.createLinearGradient(0, H * 0.55, 0, H * 0.75);
+        haze.addColorStop(0, 'transparent');
+        haze.addColorStop(0.5, 'rgba(0,180,255,0.04)');
+        haze.addColorStop(1, 'transparent');
+        ctx.fillStyle = haze;
+        ctx.fillRect(0, H * 0.55, W, H * 0.2);
+
+        /* stars */
+        ctx.fillStyle = 'rgba(200,180,255,0.6)';
+        for (let s = 0; s < 120; s++) {
+            const sx = rng(s * 3 + 1) * W;
+            const sy = rng(s * 3 + 2) * H * 0.5;
+            const br = 0.3 + 0.7 * Math.abs(Math.sin(t * (0.5 + rng(s * 3 + 3)) + s));
+            ctx.globalAlpha = br * 0.5;
+            ctx.fillRect(sx, sy, 1, 1);
+        }
+        ctx.globalAlpha = 1;
+
+        /* light beams from below */
+        for (const beam of BEAMS) {
+            const bx = beam.x * W;
+            const alpha = 0.04 + 0.03 * Math.sin(t * beam.speed + beam.phase);
+            const grad = ctx.createLinearGradient(bx, H, bx, H * 0.2);
+            grad.addColorStop(0, beam.col.replace(')', `,${alpha})`).replace('rgb', 'rgba').replace('#FF00B3', `rgba(255,0,179,${alpha})`).replace('#00FFFF', `rgba(0,255,255,${alpha})`));
+            grad.addColorStop(1, 'transparent');
+            ctx.fillStyle = beam.col === CYAN ? `rgba(0,255,255,${alpha})` : `rgba(255,0,179,${alpha})`;
+            ctx.save();
+            ctx.translate(bx, H);
+            ctx.beginPath();
+            ctx.moveTo(-12, 0); ctx.lineTo(12, 0); ctx.lineTo(4, -H * 0.7); ctx.lineTo(-4, -H * 0.7);
+            ctx.closePath();
+            const bg2 = ctx.createLinearGradient(0, 0, 0, -H * 0.7);
+            const ac = beam.col === CYAN ? [0, 255, 255] : [255, 0, 179];
+            bg2.addColorStop(0, `rgba(${ac[0]},${ac[1]},${ac[2]},${alpha})`);
+            bg2.addColorStop(1, 'transparent');
+            ctx.fillStyle = bg2;
+            ctx.fill();
+            ctx.restore();
         }
 
-        async function toggleMode() {
-            const mode = document.getElementById('modeToggle').checked ? 'stalagmite' : 'plasma';
-            try {
-                const r = await fetch('/mode', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({mode})
-                });
-                const d = await r.json();
-                showMessage(d.status, r.ok ? 'success' : 'error');
-            } catch (e) { showMessage('Network error', 'error'); }
+        /* ── BUILDINGS (back to front) ── */
+        const scaleX = W / 1920;
+        const baseY = H * 0.72;
+
+        for (let layer = 0; layer <= 2; layer++) {
+            for (let i = 0; i < BUILDINGS.length; i++) {
+                const b = BUILDINGS[i];
+                if (b.layer !== layer) continue;
+                const bx = b.x * scaleX;
+                const bw = b.w * scaleX;
+                const bh = b.h * (0.55 + layer * 0.22) * (H / 900);
+                const by = baseY - bh;
+                const alpha = 0.5 + layer * 0.25;
+
+                /* building body */
+                ctx.globalAlpha = alpha;
+                ctx.fillStyle = b.fill;
+                ctx.fillRect(bx, by, bw, bh + 10);
+
+                /* top edge accent */
+                ctx.fillStyle = layer === 2 ? '#2a1850' : '#1a0d38';
+                ctx.fillRect(bx, by, bw, 2);
+
+                /* windows */
+                ctx.globalAlpha = alpha;
+                for (const w of b.wins) {
+                    const key = `${i}_${w.c}_${w.r}`;
+                    if (!flickerState[key]) {
+                        flickerState[key] = { phase: rng(i * 10000 + w.c * 100 + w.r) * Math.PI * 2, speed: 0.1 + rng(i * 10000 + w.c * 100 + w.r + 1) * 0.4 };
+                    }
+                    const fs = flickerState[key];
+                    const brightness = 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(t * fs.speed + fs.phase));
+                    const wx = bx + 3 * scaleX + w.c * (bw - 6 * scaleX) / b.wCols;
+                    const wy = by + 8 * (H / 900) + w.r * (bh - 10 * (H / 900)) / b.wRows;
+                    const wsz = Math.max(2, 5 * scaleX * (H / 900));
+                    ctx.globalAlpha = brightness * alpha * 0.9;
+                    ctx.fillStyle = w.col;
+                    ctx.fillRect(wx, wy, wsz, wsz * 0.8);
+                }
+                ctx.globalAlpha = 1;
+
+                /* antenna */
+                if (b.hasAnt && layer >= 1) {
+                    ctx.strokeStyle = layer === 2 ? '#3a2060' : '#2a1540';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(bx + bw / 2, by);
+                    ctx.lineTo(bx + bw / 2, by - 20 * (H / 900));
+                    ctx.stroke();
+                    const blinkOn = Math.sin(t * 2.5 + i) > 0.3;
+                    if (blinkOn) {
+                        ctx.fillStyle = PINK;
+                        ctx.globalAlpha = 0.9;
+                        ctx.beginPath();
+                        ctx.arc(bx + bw / 2, by - 20 * (H / 900), 2, 0, Math.PI * 2);
+                        ctx.fill();
+                        ctx.globalAlpha = 1;
+                    }
+                }
+
+                /* billboard */
+                if (b.hasBB && layer === 2 && bw > 30) {
+                    ctx.globalAlpha = 0.85;
+                    drawBillboard(ctx, bx, by + bh * 0.15, bw, bh, b.bbType, t, i);
+                    ctx.globalAlpha = 1;
+                }
+            }
         }
 
-        async function learnTrack() {
-            try {
-                const r = await fetch('/learn', {method: 'POST'});
-                const d = await r.json();
-                showMessage(d.status || d.description, r.ok ? 'success' : 'error');
-            } catch (e) { showMessage('Network error', 'error'); }
+        /* ground plane */
+        const grd = ctx.createLinearGradient(0, baseY, 0, H);
+        grd.addColorStop(0, '#12082a');
+        grd.addColorStop(1, '#06030f');
+        ctx.fillStyle = grd;
+        ctx.fillRect(0, baseY, W, H - baseY);
+
+        /* ground grid lines */
+        ctx.strokeStyle = 'rgba(139,0,255,0.15)';
+        ctx.lineWidth = 0.5;
+        const gridLines = 16;
+        for (let gl = 0; gl <= gridLines; gl++) {
+            const gy = baseY + (gl / gridLines) * (H - baseY);
+            const vanishX = W / 2 + Math.sin(t * 0.1) * W * 0.05;
+            const spread = (gl / gridLines) * W * 0.6;
+            ctx.beginPath();
+            ctx.moveTo(vanishX - spread, gy);
+            ctx.lineTo(vanishX + spread, gy);
+            ctx.stroke();
+        }
+        /* vertical grid lines */
+        for (let vl = -10; vl <= 10; vl++) {
+            const vanishX = W / 2 + Math.sin(t * 0.1) * W * 0.05;
+            ctx.beginPath();
+            ctx.moveTo(vanishX, baseY);
+            ctx.lineTo(vanishX + vl * W * 0.06, H);
+            ctx.stroke();
         }
 
-        function showMessage(text, type) {
-            const msg = document.getElementById('message');
-            msg.innerHTML = `<div class="message ${type}">${text}</div>`;
-            setTimeout(() => msg.innerHTML = '', 5000);
+        /* neon signs */
+        for (const sg of SIGNS) {
+            const sx = sg.x * (W / 1920);
+            const sy = sg.y * H;
+            if (sx < 0 || sx > W) continue;
+            const alpha = 0.6 + 0.4 * Math.abs(Math.sin(t * sg.speed + sg.phase));
+            ctx.globalAlpha = alpha;
+            ctx.font = 'bold 9px monospace';
+            ctx.fillStyle = sg.col;
+            ctx.shadowColor = sg.col;
+            ctx.shadowBlur = 8;
+            ctx.fillText(sg.text, sx, sy);
+            ctx.shadowBlur = 0;
+            ctx.globalAlpha = 1;
         }
 
-        updateStatus();
-        setInterval(updateStatus, 2000);
-    </script>
+        /* flying particles */
+        for (const p of PARTICLES) {
+            p.x += p.vx;
+            p.y += p.vy * 0.01;
+            if (p.x > 1) p.x -= 1;
+            if (p.x < 0) p.x += 1;
+            const px = p.x * W;
+            const py = p.y * H;
+            ctx.globalAlpha = 0.5 + 0.5 * Math.sin(t * 2 + p.x * 10);
+            ctx.fillStyle = p.col;
+            ctx.fillRect(px, py, p.size, p.size);
+        }
+        ctx.globalAlpha = 1;
+
+        /* horizontal scan lines (moving) */
+        for (let sl = 0; sl < 3; sl++) {
+            const sy2 = ((t * 80 * (sl + 1) * 0.3) % H);
+            ctx.strokeStyle = sl === 0 ? 'rgba(0,255,255,0.04)' : 'rgba(255,0,179,0.03)';
+            ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(0, sy2); ctx.lineTo(W, sy2); ctx.stroke();
+        }
+
+        requestAnimationFrame(frame);
+    }
+
+    frame();
+})();
+
+/* ════════════════════════════════════════════════════
+   STATUS POLLING
+   ════════════════════════════════════════════════════ */
+function setOp(id, on, cls) {
+    const el = document.getElementById(id);
+    if (el) el.className = 'op' + (on ? ' ' + cls : '');
+}
+
+async function updateStatus() {
+    try {
+        const r = await fetch('/status');
+        const d = await r.json();
+        const vinyl = d.mode === 'vinyl';
+        const track = d.track || '---';
+        document.getElementById('sg').innerHTML = `
+            <div class="st full"><div class="sl">TRACK ID</div><div class="sv ${track==='---'?'d':'c'}">${trunc(track,30)}</div></div>
+            <div class="st"><div class="sl">INPUT</div><div class="sv ${vinyl?'p':'c'}">${d.mode.toUpperCase()}</div></div>
+            <div class="st"><div class="sl">BPM</div><div class="sv c">${d.bpm}</div></div>
+            <div class="st"><div class="sl">LEARNING</div><div class="sv ${d.learning?'g':'d'}">${d.learning?'ACTIVE':'IDLE'}</div></div>
+            <div class="st"><div class="sl">FINGERPRINT</div><div class="sv ${d.fingerprinting?'y':'d'}">${d.fingerprinting?'RUNNING':'IDLE'}</div></div>
+        `;
+        const dc = d.display_mode === 1;
+        const mc = d.visualizer_mode === 'stalagmite';
+        document.getElementById('displayToggle').checked = dc;
+        document.getElementById('modeToggle').checked    = mc;
+        setOp('op-plasma', !dc, 'oc'); setOp('op-info', dc, 'op2');
+        setOp('op-p2', !mc, 'oc');     setOp('op-st',  mc, 'op2');
+        document.getElementById('learnBtn').disabled = !vinyl;
+        document.getElementById('tblink').className = 'bk g';
+    } catch (e) {
+        document.getElementById('sg').innerHTML = `<div class="st full"><div class="sl">STATUS</div><div class="sv e">CONNECTION LOST</div></div>`;
+        document.getElementById('tblink').className = 'bk off';
+    }
+}
+
+function trunc(s, n) { return s.length > n ? s.slice(0, n-3) + '...' : s; }
+
+async function toggleDisplay() {
+    const dm = document.getElementById('displayToggle').checked ? 1 : 0;
+    setOp('op-plasma', dm===0, 'oc'); setOp('op-info', dm===1, 'op2');
+    try { const r = await fetch('/display',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({display_mode:dm})}); toast((await r.json()).status,r.ok); } catch { toast('TX ERROR',false); }
+}
+
+async function toggleMode() {
+    const mode = document.getElementById('modeToggle').checked ? 'stalagmite' : 'plasma';
+    setOp('op-p2', mode==='plasma','oc'); setOp('op-st', mode==='stalagmite','op2');
+    try { const r = await fetch('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})}); toast((await r.json()).status,r.ok); } catch { toast('TX ERROR',false); }
+}
+
+async function learnTrack() {
+    try { const r = await fetch('/learn',{method:'POST'}); const d=await r.json(); toast(d.status||d.description,r.ok); } catch { toast('TX ERROR',false); }
+}
+
+let ttimer;
+function toast(msg, ok) {
+    clearTimeout(ttimer);
+    document.getElementById('twrap').innerHTML = `<div class="toast ${ok?'ok':'err'}">${msg.toUpperCase()}</div>`;
+    ttimer = setTimeout(() => document.getElementById('twrap').innerHTML = '', 4000);
+}
+
+updateStatus();
+setInterval(updateStatus, 2000);
+</script>
 </body>
 </html>

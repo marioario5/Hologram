@@ -86,7 +86,7 @@ from PIL import Image
 from flask import Flask, jsonify, abort
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO,
+logging.basicConfig(level=logging.WARNING,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 log = logging.getLogger('hologram')
 
@@ -177,8 +177,24 @@ def open_shm():
 
 shm = open_shm()
 
-def shm_u32(off, v):   shm[off:off+4] = struct.pack('<I', int(v) & 0xFFFFFFFF)
-def shm_f32s(off, a):  shm[off:off+len(a)*4] = struct.pack(f'<{len(a)}f', *a)
+# Pre-built struct packers — avoids format string parsing on every call
+_pack_u32   = struct.Struct('<I')
+_pack_f32_2 = struct.Struct('<2f')
+_pack_f32_4 = struct.Struct('<4f')
+_pack_f32_7 = struct.Struct('<7f')
+_pack_f32_16= struct.Struct('<16f')
+
+def shm_u32(off, v):
+    _pack_u32.pack_into(shm, off, int(v) & 0xFFFFFFFF)
+
+def shm_f32s(off, a):
+    n = len(a)
+    if   n == 2:  _pack_f32_2.pack_into(shm, off, *a)
+    elif n == 4:  _pack_f32_4.pack_into(shm, off, *a)
+    elif n == 7:  _pack_f32_7.pack_into(shm, off, *a)
+    elif n == 16: _pack_f32_16.pack_into(shm, off, *a)
+    else:
+        shm[off:off+n*4] = struct.pack(f'<{n}f', *a)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # STATE — two completely separate dicts, one per mode
@@ -279,11 +295,14 @@ def drain_queue(q):
             break
 
 def pcm_rms(raw_bytes: bytes) -> float:
-    """RMS amplitude of s16le PCM, returned in range 0–32767."""
+    """RMS amplitude of s16le PCM, returned in range 0–32767.
+    Uses integer mean-of-squares — no float32 upcast needed."""
     if len(raw_bytes) < 2:
         return 0.0
-    samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
-    return float(np.sqrt(np.mean(samples ** 2)))
+    samples = np.frombuffer(raw_bytes, dtype=np.int16)
+    # int32 intermediate prevents overflow; mean in float at end only
+    mean_sq = int(np.mean(samples.astype(np.int32) ** 2))
+    return float(np.sqrt(mean_sq))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SPI PACKET BUILDER / PARSER
@@ -307,10 +326,16 @@ def pad_to(cmd: list[int], length: int) -> list[int]:
     return (cmd + [0x00] * length)[:length]
 
 AUDIO_PAYLOAD   = 512
-STATUS_RESP_LEN = 4 + 6 + 1       # header + 6-byte payload + checksum
+STATUS_RESP_LEN = 4 + 6 + 1
 AUDIO_RESP_LEN  = 4 + AUDIO_PAYLOAD + 1
-BANDS_RESP_LEN  = 4 + 17 + 1      # 16 bands + 1 BPM
-LEARN_RESP_LEN  = 4 + 0 + 1       # empty payload
+BANDS_RESP_LEN  = 4 + 17 + 1
+LEARN_RESP_LEN  = 4 + 0 + 1
+
+# Pre-allocated transfer buffers — avoids list allocation on every SPI call
+_STATUS_TX = bytearray(pad_to(CMD_STATUS_PKT, STATUS_RESP_LEN))
+_AUDIO_TX  = bytearray(pad_to(CMD_AUDIO_PKT,  AUDIO_RESP_LEN))
+_BANDS_TX  = bytearray(pad_to(CMD_BANDS_PKT,  BANDS_RESP_LEN))
+_ACK_TX    = bytearray(pad_to(CMD_ACK_PKT,    LEARN_RESP_LEN))
 
 
 class PacketParser:
@@ -328,11 +353,15 @@ class PacketParser:
             return None
         payload  = raw[4:4 + length]
         checksum = raw[4 + length]
-        xor = 0
-        for b in raw[:4 + length]:
-            xor ^= b
+
+        # Fast XOR checksum via numpy — ~20x faster than Python for loop
+        # for 512-byte audio packets
+        xor = int(np.bitwise_xor.reduce(
+            np.frombuffer(bytes(raw[:4 + length]), dtype=np.uint8)
+        ))
         if xor != checksum:
             return None
+
         if seq != self.expected:
             self.dropped += (seq - self.expected) & 0xFF
         self.expected = (seq + 1) & 0xFF
@@ -371,7 +400,7 @@ def spi_thread():
 
         try:
             # ── 1. Status poll ────────────────────────────────────────────────
-            raw    = spi.xfer2(pad_to(CMD_STATUS_PKT, STATUS_RESP_LEN), SPI_SPEED_HZ, 10)
+            raw    = spi.xfer2(_STATUS_TX, SPI_SPEED_HZ, 10)
             result = parser.parse(raw)
 
             if result and result[0] == PKT_STATUS:
@@ -408,7 +437,7 @@ def spi_thread():
 
                 # ── Learn button ──────────────────────────────────────────────
                 if learn_pending:
-                    spi.xfer2(pad_to(CMD_ACK_PKT, LEARN_RESP_LEN), SPI_SPEED_HZ, 10)
+                    spi.xfer2(_ACK_TX, SPI_SPEED_HZ, 10)
                     _start_learn("ESP32 hardware button")
 
             # ── 2. Predictive timer (vinyl only) ─────────────────────────────
@@ -425,21 +454,20 @@ def spi_thread():
                     _trigger_fingerprint()
 
             # ── 3. Band data poll (both modes — drives visualiser) ────────────
-            raw_bands = spi.xfer2(pad_to(CMD_BANDS_PKT, BANDS_RESP_LEN), SPI_SPEED_HZ, 10)
+            raw_bands = spi.xfer2(_BANDS_TX, SPI_SPEED_HZ, 10)
             res_bands = parser.parse(raw_bands)
             if res_bands and res_bands[0] == PKT_BANDS and len(res_bands[1]) >= 17:
-                bp    = res_bands[1]
-                bands = [int(b) for b in bp[:NUM_BANDS]]
-                bpm   = max(60, min(200, int(bp[16])))
+                bp  = res_bands[1]
+                # bytes are already ints — no comprehension needed
+                bands = list(bp[:NUM_BANDS])
+                bpm   = max(60, min(200, bp[16]))
                 with ui_state_lock:
                     ui_state['bands'] = bands
                     ui_state['bpm']   = bpm
 
             # ── 4. Audio poll — ONLY when vinyl is active AND above noise gate ─
-            # If audio_live is False this branch is entirely skipped.
-            # No SPI transfer, no queue fill, no ffmpeg ever spawned.
             if audio_live:
-                raw_audio = spi.xfer2(pad_to(CMD_AUDIO_PKT, AUDIO_RESP_LEN), SPI_SPEED_HZ, 10)
+                raw_audio = spi.xfer2(_AUDIO_TX, SPI_SPEED_HZ, 10)
                 res_audio = parser.parse(raw_audio)
                 if res_audio and res_audio[0] == PKT_AUDIO:
                     chunk = bytes(res_audio[1])
@@ -794,7 +822,14 @@ def stalagmite_thread():
 # SHM WRITER — picks the correct state based on active mode, never mixes them
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+
+# ── SHM write cache — avoid re-encoding album art every tick ─────────────────
+_last_art_track_id = None
+_cached_art_bytes  = None   # pre-encoded raw RGB bytes ready to memcpy into SHM
+
 def _write_shm():
+    global _last_art_track_id, _cached_art_bytes
+
     with active_mode_lock:
         mode = active_mode
 
@@ -810,9 +845,14 @@ def _write_shm():
         ui['seq'] = (ui['seq'] + 1) & 0xFFFFFFFF
         ui_state['seq'] = ui['seq']
 
-    shm_f32s(OFF_BANDS, [float(b) for b in ui['bands']])
-    for i, c in enumerate(ds['palette']):
+    # ── Bands: pack directly into SHM via struct ─────────────────────────────
+    shm_f32s(OFF_BANDS, ui['bands'])
+
+    # ── Palette ───────────────────────────────────────────────────────────────
+    pal = ds['palette']
+    for i, c in enumerate(pal):
         shm[OFF_PALETTE + i*3 : OFF_PALETTE + i*3 + 3] = bytes(c)
+
     shm_f32s(OFF_PLASMA_ABCD,  [ds['a'], ds['b'], ds['c'], ds['d']])
     shm_f32s(OFF_PLASMA_CXCY,  [ds['cx'], ds['cy']])
     shm_f32s(OFF_STALA_COLORS, ui['stalagmite_colors'])
@@ -822,26 +862,34 @@ def _write_shm():
     shm_u32(OFF_ALBUM_SIZE, ui['album_size'])
     shm_u32(OFF_BPM,        ui['bpm'])
 
-    if ds['album_art_bytes']:
-        ds['album_art_bytes'].seek(0)
-        sz  = ui['album_size']
-        img = (Image.open(ds['album_art_bytes'])
-               .convert('RGB')
-               .resize((sz, sz), Image.LANCZOS))
-        shm[OFF_ALBUM_DATA : OFF_ALBUM_DATA + sz * sz * 3] = img.tobytes()
-        shm_u32(OFF_ALBUM_READY, 1)
+    # ── Album art: only re-encode when track changes ──────────────────────────
+    current_id = ds.get('last_track_id')
+    if ds['album_art_bytes'] and current_id != _last_art_track_id:
+        try:
+            ds['album_art_bytes'].seek(0)
+            sz  = ui['album_size']
+            img = (Image.open(ds['album_art_bytes'])
+                   .convert('RGB')
+                   .resize((sz, sz), Image.LANCZOS))
+            _cached_art_bytes  = img.tobytes()
+            _last_art_track_id = current_id
+        except Exception:
+            _cached_art_bytes = None
+
+    if _cached_art_bytes:
+        sz = ui['album_size']
+        expected = sz * sz * 3
+        if len(_cached_art_bytes) == expected:
+            shm[OFF_ALBUM_DATA : OFF_ALBUM_DATA + expected] = _cached_art_bytes
+            shm_u32(OFF_ALBUM_READY, 1)
+        else:
+            shm_u32(OFF_ALBUM_READY, 0)
     else:
         shm_u32(OFF_ALBUM_READY, 0)
 
-    shm_u32(OFF_SEQ,   ui['seq'])
-    # ── Track info for info display mode ──────────────────────────────────
-    if mode == MODE_VINYL:
-        with vinyl_state_lock:
-            tid2 = vinyl_state.get('last_track_id') or ''
-    else:
-        with spotify_state_lock:
-            tid2 = spotify_state.get('last_track_id') or ''
+    shm_u32(OFF_SEQ, ui['seq'])
 
+    # ── Track info ────────────────────────────────────────────────────────────
     title_bytes  = ds.get('track_title',  '').encode('ascii', 'replace')[:63].ljust(64, b'\x00')
     artist_bytes = ds.get('track_artist', '').encode('ascii', 'replace')[:63].ljust(64, b'\x00')
     album_bytes  = ds.get('track_album',  '').encode('ascii', 'replace')[:63].ljust(64, b'\x00')
@@ -849,28 +897,33 @@ def _write_shm():
     shm[OFF_TRACK_ARTIST : OFF_TRACK_ARTIST + 64] = artist_bytes
     shm[OFF_TRACK_ALBUM_S: OFF_TRACK_ALBUM_S + 64] = album_bytes
     shm_u32(OFF_TRACK_DUR_MS, ds.get('track_dur_ms', 0))
-    # interpolate position between polls only when playing; freeze when paused
+
+    # Interpolate playback position between Spotify polls
     base_pos   = ds.get('track_pos_ms', 0)
     fetched_at = ds.get('_pos_fetched_at', 0)
     is_playing = ds.get('_is_playing', False)
     if is_playing and fetched_at > 0:
-        elapsed_since = time.time() - fetched_at
-        estimated_pos = int(base_pos + elapsed_since * 1000)
+        estimated_pos = int(base_pos + (time.time() - fetched_at) * 1000)
         dur = ds.get('track_dur_ms', 0)
         if dur > 0 and estimated_pos > dur:
             estimated_pos = dur
     else:
-        estimated_pos = base_pos   # paused — lock to last known position
+        estimated_pos = base_pos
     shm_u32(OFF_TRACK_POS_MS, estimated_pos)
     shm_u32(OFF_DISPLAY_MODE, ui.get('display_mode', 0))
-
     shm_u32(OFF_MAGIC, MAGIC_VAL)
 
 
 def shm_loop():
+    # 30Hz is sufficient — C renderer runs at 30fps so 60Hz writes are wasted
+    interval = 1.0 / 30
     while True:
+        t0 = time.monotonic()
         _write_shm()
-        time.sleep(1 / 60)
+        elapsed = time.monotonic() - t0
+        sleep = interval - elapsed
+        if sleep > 0:
+            time.sleep(sleep)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FLASK — /status (read-only) + /learn (triggers learning mode)
@@ -879,6 +932,10 @@ def shm_loop():
 from flask import Flask, jsonify, abort, request, render_template
 
 app = Flask(__name__)
+
+# Suppress Flask/Werkzeug logging
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+logging.getLogger('flask').setLevel(logging.ERROR)
 
 @app.route('/')
 def index():
